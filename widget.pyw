@@ -5234,6 +5234,11 @@ _TB_SPI_GETHIGHCONTRAST = 0x0042
 _TB_HCF_HIGHCONTRASTON = 0x1
 _TB_AC_SRC_ALPHA = 0x1
 _TB_DIB_RGB_COLORS = 0
+_TB_WM_MOUSEMOVE = 0x0200
+_TB_WM_MOUSELEAVE = 0x02A3
+_TB_TME_LEAVE = 0x2
+# Same translucent wash the Codex strip uses for its hover state.
+_TB_HOVER_FILL = (127, 127, 127, 80)
 _TB_UIA_BUTTON = 50000
 _TB_POLL_MS = 1500
 _TB_COINIT_MULTITHREADED = 0
@@ -5241,23 +5246,28 @@ _TB_RPC_E_CHANGED_MODE = -2147417850
 
 # Logical-pixel layout, identical to the approved Codex contract:
 # mark on the LEFT, usage block (label + bar + right-aligned %) on the right.
-_TB_MARK_W = 38
+# SHARED STRIP CONTRACT — identical numbers in the Codex widget
+# (taskbar_render.py / taskbar_placement.py). The two strips sit side by side
+# on the taskbar, so any change here must be mirrored there or they stop
+# looking like twins. Padding was trimmed on 2026-09-14 so both fit the free
+# run left of the Start button at their FULL width.
+_TB_MARK_W = 30
 _TB_MARK_H = 44
-_TB_GAP = 5
+_TB_GAP = 4
 # Usage block columns: label | bar | right-aligned %. The bar ran 45..104
 # (59px) until 2026-09-14, when the user asked for 80% of that length; it is
-# now 47px and the severity COLOUR carries the reading. The strip and its
-# shrink floor gave up the same 12px.
-_TB_BAR_L = 45
+# now 47px and the severity COLOUR carries the reading.
+_TB_BAR_L = 34                                           # label column
 _TB_BAR_W = 47                                           # 80% of the old 59
-_TB_PCT_W = 42                                           # widest "100%"
-_TB_PAD_R = 8
-_TB_USAGE_W = _TB_BAR_L + _TB_BAR_W + _TB_PCT_W + _TB_PAD_R      # 142
+_TB_PCT_W = 42                                           # widest "57.5%"
+_TB_PAD_R = 4
+_TB_USAGE_W = _TB_BAR_L + _TB_BAR_W + _TB_PCT_W + _TB_PAD_R      # 127
 _TB_HEIGHT = 46
-_TB_PREF_W = _TB_MARK_W + _TB_GAP + _TB_USAGE_W          # 185
-# Shrink floor: the renderer gives up the bar column before the strip itself
-# gives up, so the label and the percentage always stay readable.
-_TB_MIN_W = _TB_PREF_W - _TB_BAR_W                       # 138
+_TB_PREF_W = _TB_MARK_W + _TB_GAP + _TB_USAGE_W          # 161
+# No squeezed-bar mode any more: a slot narrower than the shared width would
+# render a stubby bar next to the Codex strip's full one, so fall back to the
+# next free run (and finally to no strip at all) instead.
+_TB_MIN_W = _TB_PREF_W                                   # 161
 _TB_SS = 3  # supersample factor for text
 
 
@@ -5290,6 +5300,11 @@ class _TB_WNDCLASSW(ctypes.Structure):
 class _TB_HIGHCONTRASTW(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.UINT), ("dwFlags", wintypes.DWORD),
                 ("lpszDefaultScheme", wintypes.LPWSTR)]
+
+
+class _TB_TRACKMOUSEEVENT(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("hwndTrack", wintypes.HWND), ("dwHoverTime", wintypes.DWORD)]
 
 
 class _TB_POINT(ctypes.Structure):
@@ -5376,6 +5391,8 @@ def _tb_u32():
         lib.SetWindowTextW.restype = wintypes.BOOL
         lib.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
         lib.GetCursorPos.restype = wintypes.BOOL
+        lib.TrackMouseEvent.argtypes = [ctypes.POINTER(_TB_TRACKMOUSEEVENT)]
+        lib.TrackMouseEvent.restype = wintypes.BOOL
         lib.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         lib.GetClassNameW.restype = ctypes.c_int
         lib.EnumChildWindows.argtypes = [wintypes.HWND, ctypes.c_void_p,
@@ -5757,18 +5774,26 @@ def _tb_layout(width, height, dpi):
     return (0, mark_top, mark_w, mark_top + mark_h), mark_w + gap, top, content_h
 
 
-def _tb_render(rows, message, stale, width, height, dpi, light, high_contrast):
+def _tb_render(rows, message, stale, width, height, dpi, light, high_contrast,
+               hover=False):
     """Render the 2-row taskbar strip as straight-alpha RGBA pixels."""
     width, height = max(1, width), max(1, height)
     dpi = max(96, dpi)
     scale = dpi / 96.0
     factor = scale * _TB_SS
     palette = _tb_palette(light, high_contrast)
-    mark_box, usage_l, top, _ = _tb_layout(width, height, dpi)
+    mark_box, usage_l, top, content_h = _tb_layout(width, height, dpi)
 
     # Pass 1: text only, supersampled then downsampled for clean antialiasing.
     canvas = Image.new("RGBA", (width * _TB_SS, height * _TB_SS))
     draw = ImageDraw.Draw(canvas)
+    if hover:
+        # Same treatment as the Codex strip: a translucent wash under the
+        # content so the user can see the strip is clickable.
+        draw.rounded_rectangle(
+            (0, top * _TB_SS, (width - 1) * _TB_SS,
+             (top + content_h - 1) * _TB_SS),
+            radius=int(round(7 * factor)), fill=_TB_HOVER_FILL)
 
     def sx(value):
         return int(round((usage_l + value * scale) * _TB_SS))
@@ -5959,6 +5984,7 @@ class TaskbarSurface:
         self._visible = True
         self._available = False
         self._attached = False
+        self._hover = False
         self._hwnd = 0
         self._wndproc = None
         self._target = None
@@ -6082,6 +6108,22 @@ class TaskbarSurface:
             return 0
         if message == _TB_WM_ERASEBKGND:
             return 1
+        if message == _TB_WM_MOUSEMOVE:
+            if not self._hover:
+                self._hover = True
+                self._paint(hwnd)
+            # Re-arm every move: Windows cancels the leave request each time
+            # it fires, and one missed WM_MOUSELEAVE leaves the wash stuck on.
+            track = _TB_TRACKMOUSEEVENT(
+                cbSize=ctypes.sizeof(_TB_TRACKMOUSEEVENT),
+                dwFlags=_TB_TME_LEAVE, hwndTrack=hwnd)
+            u.TrackMouseEvent(ctypes.byref(track))
+            return 0
+        if message == _TB_WM_MOUSELEAVE:
+            if self._hover:
+                self._hover = False
+                self._paint(hwnd)
+            return 0
         if message in (_TB_WM_LBUTTONUP, _TB_WM_RBUTTONUP):
             point = wintypes.POINT()
             u.GetCursorPos(ctypes.byref(point))
@@ -6131,7 +6173,7 @@ class TaskbarSurface:
             _tb_publish(hwnd, _tb_render(
                 rows, message, stale, bounds.right, bounds.bottom,
                 max(96, int(u.GetDpiForWindow(hwnd) or 96)),
-                _tb_light_theme(), _tb_high_contrast()))
+                _tb_light_theme(), _tb_high_contrast(), self._hover))
         except Exception:
             with self._lock:
                 self._attached = False
