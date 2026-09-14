@@ -15,7 +15,8 @@ Always-on-top Windows desktop widget showing real-time Claude Max plan usage. Ma
 - **Multi-monitor** aware — drag to any screen
 - **31 pixel pets** with whole-body animations (bounce/sway/float/squish/breathe), random assignment on first run
 - **System tray** — X button minimizes to tray; left-click tray to toggle, right-click for menu
-- **Taskbar strip** — a two-row 5h / weekly readout embedded in the real Windows taskbar (mark on the left, remaining % on the right). Left-click shows/hides the desktop widget, right-click opens the same menu. Toggle it from the right-click menu ("작업표시줄 표시"); it is skipped silently on a vertical taskbar, without `comtypes`, or when the taskbar has no free space.
+- **Independent display modes** — the right-click menu selects exactly one desktop state under “데스크톱 위젯” (normal, mini, or hidden), while “작업표시줄 표시” independently shows or hides the taskbar strip. The same menu and state are used from either surface and survive restart.
+- **Taskbar strip** — a two-row 5h / weekly readout embedded in the real Windows taskbar (mark on the left, remaining % on the right). Left-click hides the desktop widget or restores its last visible mode; right-click opens the shared menu. It is skipped silently on a vertical taskbar, without `comtypes`, or when the taskbar has no free space.
 - **Gradient bars** — smooth green → yellow → red as usage climbs
 - **Single file** — `widget.pyw` is fully self-contained (~280 KB with embedded pet sprites)
 - **Auto-update** — checks GitHub Releases on launch and every 12 h; a new version is verified (sha256 + syntax + self-test) before it replaces itself, and the previous file is kept as `widget.pyw.bak`
