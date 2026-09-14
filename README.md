@@ -15,6 +15,7 @@ Always-on-top Windows desktop widget showing real-time Claude Max plan usage. Ma
 - **Multi-monitor** aware — drag to any screen
 - **31 pixel pets** with whole-body animations (bounce/sway/float/squish/breathe), random assignment on first run
 - **System tray** — X button minimizes to tray; left-click tray to toggle, right-click for menu
+- **Taskbar strip** — a two-row 5h / weekly readout embedded in the real Windows taskbar (mark on the left, remaining % on the right). Left-click shows/hides the desktop widget, right-click opens the same menu. Toggle it from the right-click menu ("작업표시줄 표시"); it is skipped silently on a vertical taskbar, without `comtypes`, or when the taskbar has no free space.
 - **Gradient bars** — smooth green → yellow → red as usage climbs
 - **Single file** — `widget.pyw` is fully self-contained (~280 KB with embedded pet sprites)
 - **Auto-update** — checks GitHub Releases on launch and every 12 h; a new version is verified (sha256 + syntax + self-test) before it replaces itself, and the previous file is kept as `widget.pyw.bak`
@@ -24,14 +25,15 @@ Always-on-top Windows desktop widget showing real-time Claude Max plan usage. Ma
 - Windows 10/11
 - Python 3.8+
 - [Claude Code](https://claude.com/code) installed and logged in (`claude login`)
-- `pip install pillow pystray`
+- `pip install pillow pystray comtypes`
+  - `comtypes` is only needed for the taskbar strip (it locates the real taskbar buttons via UI Automation). Without it the desktop widget still works; the taskbar strip is silently skipped.
 
 The widget reads the OAuth token Claude Code stores in `~/.claude/.credentials.json` — no manual API key or cookie handling needed. It also **auto-refreshes the token** when it expires, so it keeps working without running Claude Code (see [Token handling](#token-handling-automatic)).
 
 ## Install
 
 ```bash
-pip install pillow pystray
+pip install pillow pystray comtypes
 ```
 
 Download the latest `widget.pyw` (this link always points at the newest release):
@@ -165,7 +167,7 @@ ver   # should show "Microsoft Windows"
 python --version
 
 # 2b. Required Python packages
-pip install pillow pystray
+pip install pillow pystray comtypes
 
 # 3. Claude Code installed and logged in
 test -f "$USERPROFILE/.claude/.credentials.json" && python -c "
@@ -190,10 +192,10 @@ INSTALL_DIR="$HOME/claude-usage-widget"
 git clone https://github.com/kindsusu/claude-usage-widget.git "$INSTALL_DIR"
 
 # Install Python deps
-pip install pillow pystray
+pip install pillow pystray comtypes
 
 # Verify imports work
-python -c "from PIL import Image, ImageTk; import pystray; print('deps OK')"
+python -c "from PIL import Image, ImageTk; import pystray, comtypes; print('deps OK')"
 ```
 
 ### Launch

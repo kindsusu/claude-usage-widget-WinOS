@@ -18,11 +18,12 @@ import base64
 import ctypes
 from ctypes import wintypes
 import hashlib
+import importlib.util
 import io
 import json
 import os
+import queue
 import random
-import os
 import shutil
 import subprocess
 import sys
@@ -33,7 +34,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image, ImageTk, ImageFont, ImageDraw
+from PIL import Image, ImageTk, ImageFont, ImageDraw, ImageChops
 
 try:
     import pystray
@@ -73,6 +74,7 @@ DEFAULT_CONFIG = {
     "minimized": False,  # iPhone-battery mini mode
     "mini_scale": 1.0,  # independent mini-mode size, adjustable live
     "auto_update": True,  # pull new releases from GitHub and self-restart
+    "taskbar_visible": True,  # embedded 2-row strip inside the real taskbar
 }
 
 # Keys that never persist to widget_config.json — changes via the prompt
@@ -5159,6 +5161,952 @@ def clamp_rect_to_monitor(x, y, w, h, mon):
     return (x, y)
 
 
+# ---------------- Taskbar embedded display ----------------
+# Self-contained port of the validated Codex widget surface (taskbar_native /
+# taskbar_render / taskbar_placement). A WS_EX_LAYERED child window is
+# SetParent-ed into Shell_TrayWnd and painted with per-pixel alpha.
+#
+# EVERY failure path here disables only this surface. Missing comtypes, a
+# vertical taskbar, a failed embed, an Explorer restart mid-attach: the
+# desktop widget keeps running untouched and no config is rewritten.
+
+# UI Automation (needed to locate the real taskbar buttons) lives in comtypes.
+# find_spec only probes — importing comtypes here would fix its apartment
+# model before the observer thread can ask for MTA.
+_TB_HAS_COMTYPES = importlib.util.find_spec("comtypes") is not None
+
+_TB_CLASS_NAME = "ClaudeUsageTaskbarSurface"
+# Sibling usage widgets that already live in the taskbar. They are plain child
+# windows, not UIA buttons, so the button sweep below never sees them; without
+# this list the two surfaces would be placed on top of each other.
+_TB_SIBLING_PREFIXES = ("CodexUsageTaskbar", "ClaudeUsageTaskbarSurface")
+
+_TB_WM_DESTROY = 0x0002
+_TB_WM_PAINT = 0x000F
+_TB_WM_ERASEBKGND = 0x0014
+_TB_WM_LBUTTONUP = 0x0202
+_TB_WM_RBUTTONUP = 0x0205
+_TB_WM_APP_UPDATE = 0x8001
+_TB_WM_APP_VISIBILITY = 0x8002
+_TB_WM_APP_STOP = 0x8003
+_TB_WM_APP_LAYOUT = 0x8004
+_TB_WS_CHILD = 0x40000000
+_TB_WS_POPUP = 0x80000000
+_TB_WS_CLIPSIBLINGS = 0x04000000
+_TB_WS_EX_LAYERED = 0x00080000
+_TB_WS_EX_NOACTIVATE = 0x08000000
+_TB_WS_EX_TOOLWINDOW = 0x00000080
+_TB_GWL_STYLE = -16
+_TB_ULW_ALPHA = 0x2
+_TB_SW_HIDE = 0
+_TB_SW_SHOWNOACTIVATE = 4
+_TB_SWP_NOACTIVATE = 0x0010
+_TB_SWP_FRAMECHANGED = 0x0020
+_TB_SPI_GETHIGHCONTRAST = 0x0042
+_TB_HCF_HIGHCONTRASTON = 0x1
+_TB_AC_SRC_ALPHA = 0x1
+_TB_DIB_RGB_COLORS = 0
+_TB_UIA_BUTTON = 50000
+_TB_POLL_MS = 1500
+_TB_COINIT_MULTITHREADED = 0
+_TB_RPC_E_CHANGED_MODE = -2147417850
+
+# Logical-pixel layout, identical to the approved Codex contract:
+# mark on the LEFT, usage block (label + bar + right-aligned %) on the right.
+_TB_MARK_W = 38
+_TB_MARK_H = 44
+_TB_GAP = 5
+_TB_USAGE_W = 154
+_TB_HEIGHT = 46
+_TB_PREF_W = _TB_MARK_W + _TB_GAP + _TB_USAGE_W          # 197
+# Shrink floor. Codex demands its full 197px and vanishes otherwise; a real
+# taskbar with a dozen pinned apps often leaves ~160px next to the tray, so a
+# hard 197 would make the strip blink in and out as apps open and close. The
+# renderer squeezes the progress bar instead — below 150 the bar would be
+# shorter than the label, so that is where we give up.
+_TB_MIN_W = 150
+_TB_SS = 3  # supersample factor for text
+
+
+class _TB_RECT(ctypes.Structure):
+    _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+
+class _TB_PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [("hdc", wintypes.HDC), ("fErase", wintypes.BOOL),
+                ("rcPaint", _TB_RECT), ("fRestore", wintypes.BOOL),
+                ("fIncUpdate", wintypes.BOOL), ("rgbReserved", ctypes.c_byte * 32)]
+
+
+_TB_LRESULT = wintypes.LPARAM
+_TB_WNDPROC = ctypes.WINFUNCTYPE(_TB_LRESULT, wintypes.HWND, wintypes.UINT,
+                                  wintypes.WPARAM, wintypes.LPARAM)
+_TB_ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+class _TB_WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", _TB_WNDPROC),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR)]
+
+
+class _TB_HIGHCONTRASTW(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwFlags", wintypes.DWORD),
+                ("lpszDefaultScheme", wintypes.LPWSTR)]
+
+
+class _TB_POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class _TB_SIZE(ctypes.Structure):
+    _fields_ = [("cx", wintypes.LONG), ("cy", wintypes.LONG)]
+
+
+class _TB_BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [("BlendOp", wintypes.BYTE), ("BlendFlags", wintypes.BYTE),
+                ("SourceConstantAlpha", wintypes.BYTE),
+                ("AlphaFormat", wintypes.BYTE)]
+
+
+class _TB_BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD)]
+
+
+class _TB_BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _TB_BITMAPINFOHEADER),
+                ("bmiColors", wintypes.DWORD * 1)]
+
+
+_TB_U32 = None
+_TB_G32 = None
+
+
+def _tb_u32():
+    """A private user32 handle — never touch the shared `_user32` argtypes."""
+    global _TB_U32
+    if _TB_U32 is None:
+        lib = ctypes.WinDLL("user32", use_last_error=True)
+        lib.RegisterClassW.argtypes = [ctypes.POINTER(_TB_WNDCLASSW)]
+        lib.RegisterClassW.restype = wintypes.ATOM
+        lib.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+        lib.UnregisterClassW.restype = wintypes.BOOL
+        lib.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+        lib.CreateWindowExW.restype = wintypes.HWND
+        lib.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        lib.DefWindowProcW.restype = _TB_LRESULT
+        lib.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM]
+        lib.PostMessageW.restype = wintypes.BOOL
+        lib.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                     wintypes.UINT, wintypes.UINT]
+        lib.GetMessageW.restype = wintypes.BOOL
+        lib.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        lib.TranslateMessage.restype = wintypes.BOOL
+        lib.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        lib.DispatchMessageW.restype = _TB_LRESULT
+        lib.UpdateLayeredWindow.argtypes = [
+            wintypes.HWND, wintypes.HDC, ctypes.POINTER(_TB_POINT),
+            ctypes.POINTER(_TB_SIZE), wintypes.HDC, ctypes.POINTER(_TB_POINT),
+            wintypes.COLORREF, ctypes.POINTER(_TB_BLENDFUNCTION), wintypes.DWORD]
+        lib.UpdateLayeredWindow.restype = wintypes.BOOL
+        lib.GetDC.argtypes = [wintypes.HWND]
+        lib.GetDC.restype = wintypes.HDC
+        lib.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        lib.ReleaseDC.restype = ctypes.c_int
+        lib.BeginPaint.argtypes = [wintypes.HWND, ctypes.POINTER(_TB_PAINTSTRUCT)]
+        lib.BeginPaint.restype = wintypes.HDC
+        lib.EndPaint.argtypes = [wintypes.HWND, ctypes.POINTER(_TB_PAINTSTRUCT)]
+        lib.EndPaint.restype = wintypes.BOOL
+        lib.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(_TB_RECT)]
+        lib.GetClientRect.restype = wintypes.BOOL
+        lib.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        lib.ShowWindow.restype = wintypes.BOOL
+        lib.DestroyWindow.argtypes = [wintypes.HWND]
+        lib.DestroyWindow.restype = wintypes.BOOL
+        lib.IsWindow.argtypes = [wintypes.HWND]
+        lib.IsWindow.restype = wintypes.BOOL
+        lib.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+        lib.SetWindowTextW.restype = wintypes.BOOL
+        lib.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        lib.GetCursorPos.restype = wintypes.BOOL
+        lib.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        lib.GetClassNameW.restype = ctypes.c_int
+        lib.EnumChildWindows.argtypes = [wintypes.HWND, ctypes.c_void_p,
+                                          wintypes.LPARAM]
+        lib.EnumChildWindows.restype = wintypes.BOOL
+        lib.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT,
+                                               wintypes.LPVOID, wintypes.UINT]
+        lib.SystemParametersInfoW.restype = wintypes.BOOL
+        lib.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        lib.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        lib.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int,
+                                           ctypes.c_ssize_t]
+        lib.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+        lib.GetParent.argtypes = [wintypes.HWND]
+        lib.GetParent.restype = wintypes.HWND
+        lib.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+        lib.SetParent.restype = wintypes.HWND
+        lib.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                      wintypes.UINT]
+        lib.SetWindowPos.restype = wintypes.BOOL
+        lib.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        lib.FindWindowW.restype = wintypes.HWND
+        lib.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_TB_RECT)]
+        lib.GetWindowRect.restype = wintypes.BOOL
+        lib.GetDpiForWindow.argtypes = [wintypes.HWND]
+        lib.GetDpiForWindow.restype = wintypes.UINT
+        lib.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        lib.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        _TB_U32 = lib
+    return _TB_U32
+
+
+def _tb_g32():
+    global _TB_G32
+    if _TB_G32 is None:
+        lib = ctypes.WinDLL("gdi32", use_last_error=True)
+        lib.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        lib.DeleteObject.restype = wintypes.BOOL
+        lib.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+        lib.SelectObject.restype = wintypes.HGDIOBJ
+        lib.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        lib.CreateCompatibleDC.restype = wintypes.HDC
+        lib.DeleteDC.argtypes = [wintypes.HDC]
+        lib.DeleteDC.restype = wintypes.BOOL
+        lib.CreateDIBSection.argtypes = [
+            wintypes.HDC, ctypes.POINTER(_TB_BITMAPINFO), wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
+        lib.CreateDIBSection.restype = wintypes.HBITMAP
+        _TB_G32 = lib
+    return _TB_G32
+
+
+# ----- geometry (rects are plain (left, top, right, bottom) tuples) -----
+
+def _tb_lp(value, dpi):
+    """Scale logical pixels by the target taskbar DPI."""
+    return max(1, (value * max(96, dpi) + 48) // 96)
+
+
+def _tb_place(taskbar, notify, occupied, regions, dpi):
+    """Pick unused taskbar space, preferring the run before the tray icons."""
+    tl, tt, tr, tb = taskbar
+    tw, th = tr - tl, tb - tt
+    if th > tw:
+        return None                      # vertical taskbar: not supported
+    height = min(th, _tb_lp(_TB_HEIGHT, dpi))
+    if height < _tb_lp(32, dpi):
+        return None
+    gap = _tb_lp(4, dpi)
+    pref = _tb_lp(_TB_PREF_W, dpi)
+    floor = _tb_lp(_TB_MIN_W, dpi)
+    right = min(tr, notify[0] - gap)
+    left_edge = tl if occupied is None else max(tl, occupied[2]) + gap
+    available = right - left_edge
+    if available >= floor:
+        width = min(pref, available)
+        left = right - width
+    else:
+        # Windows reserves the leading edge for Widgets even when UIA exposes
+        # no button there, so only search gaps after that conservative bound.
+        gap_left = tl + _tb_lp(200, dpi)
+        left = None
+        width = pref
+        ordered = sorted((r for r in regions if r[2] > r[0] and r[3] > r[1]),
+                         key=lambda r: r[0])
+        for region in (*ordered, notify):
+            gap_right = min(tr, region[0] - gap)
+            if gap_right - gap_left >= floor:
+                width = min(pref, gap_right - gap_left)
+                left = gap_right - width
+                break
+            gap_left = max(gap_left, region[2] + gap)
+        if left is None:
+            return None                  # no room: caller silently gives up
+        right = left + width
+    top = tt + max(0, (th - height) // 2)
+    return (left, top, right, top + height)
+
+
+def _tb_window_rect(hwnd):
+    native = _TB_RECT()
+    if not hwnd or not _tb_u32().GetWindowRect(hwnd, ctypes.byref(native)):
+        return None
+    return (native.left, native.top, native.right, native.bottom)
+
+
+def _tb_child_rect(parent, classes):
+    """Rect of the first descendant window matching one of `classes`."""
+    u = _tb_u32()
+    found = ctypes.c_void_p()
+
+    @_TB_ENUMPROC
+    def visit(hwnd, _):
+        name = ctypes.create_unicode_buffer(128)
+        u.GetClassNameW(hwnd, name, len(name))
+        if name.value in classes:
+            found.value = hwnd
+            return False
+        return True
+
+    u.EnumChildWindows(parent, visit, 0)
+    return _tb_window_rect(int(found.value or 0)) if found.value else None
+
+
+def _tb_sibling_rects(taskbar, own_hwnd):
+    """Rects of other embedded usage widgets, so we never place on top."""
+    u = _tb_u32()
+    found = []
+
+    @_TB_ENUMPROC
+    def visit(hwnd, _):
+        if hwnd != own_hwnd:
+            name = ctypes.create_unicode_buffer(128)
+            u.GetClassNameW(hwnd, name, len(name))
+            if name.value.startswith(_TB_SIBLING_PREFIXES):
+                rect = _tb_window_rect(hwnd)
+                if rect is not None and rect[2] > rect[0]:
+                    found.append(rect)
+        return True
+
+    u.EnumChildWindows(taskbar, visit, 0)
+    return tuple(found)
+
+
+def _tb_uia_buttons(taskbar, bounds):
+    """(class_name, rect) for every real taskbar button, via UI Automation.
+
+    Must run on a thread that is NOT the taskbar's own — asking UIA about the
+    tree from inside the provider thread deadlocks. Providers live in another
+    process and raise COMError (not an OSError) across Explorer restarts, so
+    the guard here is deliberately broad."""
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    ole32.CoInitializeEx.argtypes = [wintypes.LPVOID, wintypes.DWORD]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+    initialized = int(ole32.CoInitializeEx(None, _TB_COINIT_MULTITHREADED))
+    if initialized < 0 and initialized != _TB_RPC_E_CHANGED_MODE:
+        return ()
+    should_uninitialize = initialized in (0, 1)
+    try:
+        # comtypes latches an apartment model on first import; force MTA to
+        # match this dedicated observer thread before importing it.
+        sys.coinit_flags = _TB_COINIT_MULTITHREADED
+        import comtypes.client
+        comtypes.client.GetModule("UIAutomationCore.dll")
+        from comtypes.gen import UIAutomationClient
+        automation = comtypes.client.CreateObject(
+            "{ff48dba4-60ef-4201-aa87-54103eef594e}",
+            interface=UIAutomationClient.IUIAutomation)
+        root = automation.ElementFromHandle(taskbar)
+        elements = root.FindAll(4, automation.CreateTrueCondition())
+        found = []
+        for index in range(elements.Length):
+            element = elements.GetElement(index)
+            native = element.CurrentBoundingRectangle
+            rect = (round(native.left), round(native.top),
+                    round(native.right), round(native.bottom))
+            if (element.CurrentControlType == _TB_UIA_BUTTON
+                    and rect[2] > rect[0] and rect[3] > rect[1]
+                    and _tb_intersects(rect, bounds)):
+                found.append((str(element.CurrentClassName), rect))
+        return tuple(found)
+    except Exception:
+        return ()
+    finally:
+        if should_uninitialize:
+            ole32.CoUninitialize()
+
+
+def _tb_intersects(a, b):
+    return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
+
+
+def _tb_union(rects):
+    if not rects:
+        return None
+    return (min(r[0] for r in rects), min(r[1] for r in rects),
+            max(r[2] for r in rects), max(r[3] for r in rects))
+
+
+def _tb_find_target(own_hwnd):
+    """(taskbar_hwnd, taskbar_rect, placement_rect, dpi) or None."""
+    u = _tb_u32()
+    taskbar = int(u.FindWindowW("Shell_TrayWnd", None) or 0)
+    if not taskbar:
+        return None
+    bounds = _tb_window_rect(taskbar)
+    if bounds is None:
+        return None
+    notify = _tb_child_rect(taskbar, {"TrayNotifyWnd", "ClockButton"})
+    if notify is None:
+        return None
+    buttons = _tb_uia_buttons(taskbar, bounds)
+    # No task-list button means UIA gave us nothing usable (Explorer mid
+    # restart, comtypes broken); placing blind would land on top of something.
+    if not any(name == "Taskbar.TaskListButtonAutomationPeer"
+               for name, _ in buttons):
+        return None
+    regions = tuple(rect for _, rect in buttons)
+    regions += _tb_sibling_rects(taskbar, own_hwnd)
+    before = tuple(r for r in regions if r[0] < notify[0])
+    dpi = max(96, int(u.GetDpiForWindow(taskbar) or 96))
+    placement = _tb_place(bounds, notify, _tb_union(before), regions, dpi)
+    if placement is None:
+        return None
+    return (taskbar, bounds, placement, dpi)
+
+
+# ----- rendering -----
+
+_TB_FONTS = {}
+_TB_MARKS = {}
+
+
+def _tb_font(size_px, semibold, hangul):
+    key = (size_px, semibold, hangul)
+    font = _TB_FONTS.get(key)
+    if font is not None:
+        return font
+    windows = Path("C:/Windows/Fonts")
+    if hangul:
+        names = ("malgunbd.ttf", "malgun.ttf") if semibold else ("malgun.ttf",)
+    else:
+        # seguisb is a real 600-weight face; the variable font's weight
+        # selection is unreliable across Pillow builds.
+        names = (("seguisb.ttf", "segoeui.ttf") if semibold
+                 else ("SegUIVar.ttf", "segoeui.ttf"))
+    for name in names:
+        try:
+            font = ImageFont.truetype(str(windows / name), max(1, size_px))
+        except OSError:
+            continue
+        break
+    else:
+        font = ImageFont.load_default(size=max(1, size_px))
+    _TB_FONTS[key] = font
+    return font
+
+
+def _tb_mark(target_height):
+    """The embedded tray mark, scaled by a whole multiple.
+
+    The asset is a 16x10 pixel-art grid stored at 4x. NEAREST at an integer
+    multiple keeps the pixel edges crisp; a fractional LANCZOS resize turns
+    the art to mush."""
+    mult = max(1, int(round(target_height / 10.0)))
+    image = _TB_MARKS.get(mult)
+    if image is None:
+        source = Image.open(io.BytesIO(base64.b64decode(TRAY_ICON_B64)))
+        image = source.convert("RGBA").resize((16 * mult, 10 * mult),
+                                               Image.Resampling.NEAREST)
+        _TB_MARKS[mult] = image
+    return image
+
+
+def _tb_palette(light, high_contrast):
+    if high_contrast:
+        c = "#000000" if light else "#ffffff"
+        return {"text": c, "muted": c, "track": c, "green": c, "amber": c, "red": c}
+    return {
+        "text":  "#172033" if light else "#f3f6fb",
+        "muted": "#5e6b7d" if light else "#aeb8c7",
+        "track": "#dfe6ef" if light else "#3a4558",
+        "green": "#18864b" if light else "#47c77d",
+        "amber": "#c27612" if light else "#e6a842",
+        "red":   "#c53532" if light else "#ff716c",
+    }
+
+
+def _tb_severity(remaining, palette):
+    if remaining <= 20:
+        return palette["red"]
+    if remaining <= 50:
+        return palette["amber"]
+    return palette["green"]
+
+
+def _tb_percent_text(value):
+    return f"{value:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def _tb_capsule(image, box, color):
+    """Composite one exact-color capsule through a supersampled alpha mask.
+
+    Drawing the bars on the supersampled canvas and downsampling would blend
+    the fill colour with the transparent background at the ends; masking the
+    alpha only keeps the colour exact."""
+    mask = Image.new("L", (image.width * _TB_SS, image.height * _TB_SS))
+    scaled = tuple(int(round(v * _TB_SS)) for v in box)
+    radius = max(1, int(round(min(box[2] - box[0], box[3] - box[1])
+                               * _TB_SS / 2)))
+    ImageDraw.Draw(mask).rounded_rectangle(scaled, radius=radius, fill=255)
+    mask = mask.resize(image.size, Image.Resampling.LANCZOS)
+    solid = Image.new("RGBA", image.size, color)
+    solid.putalpha(mask)
+    image.alpha_composite(solid)
+
+
+def _tb_layout(width, height, dpi):
+    """(mark_box, usage_left, content_top, content_height) in physical px."""
+    scale = max(96, dpi) / 96.0
+    mark_w = min(width, int(round(_TB_MARK_W * scale)))
+    gap = min(max(0, width - mark_w), int(round(_TB_GAP * scale)))
+    content_h = min(height, int(round(_TB_HEIGHT * scale)))
+    top = max(0, (height - content_h) // 2)
+    mark_h = min(content_h, int(round(_TB_MARK_H * scale)))
+    mark_top = top + (content_h - mark_h) // 2
+    return (0, mark_top, mark_w, mark_top + mark_h), mark_w + gap, top, content_h
+
+
+def _tb_render(rows, message, stale, width, height, dpi, light, high_contrast):
+    """Render the 2-row taskbar strip as straight-alpha RGBA pixels."""
+    width, height = max(1, width), max(1, height)
+    dpi = max(96, dpi)
+    scale = dpi / 96.0
+    factor = scale * _TB_SS
+    palette = _tb_palette(light, high_contrast)
+    mark_box, usage_l, top, _ = _tb_layout(width, height, dpi)
+
+    # Pass 1: text only, supersampled then downsampled for clean antialiasing.
+    canvas = Image.new("RGBA", (width * _TB_SS, height * _TB_SS))
+    draw = ImageDraw.Draw(canvas)
+
+    def sx(value):
+        return int(round((usage_l + value * scale) * _TB_SS))
+
+    def sy(value):
+        return int(round((top + value * scale) * _TB_SS))
+
+    centers = (23.0,) if len(rows) == 1 else (13.5, 32.5)
+    if rows:
+        pct_right = min(sx(146), int(round((width - 8 * scale) * _TB_SS)))
+        for (label, remaining), center in zip(rows, centers):
+            draw.text((sx(8), sy(center)), label,
+                      font=_tb_font(int(round(11 * factor)), False, True),
+                      fill=palette["muted"], anchor="lm")
+            draw.text((pct_right, sy(center)), _tb_percent_text(remaining),
+                      font=_tb_font(int(round(14 * factor)), True, False),
+                      fill=palette["text"], anchor="rm")
+    else:
+        draw.text((sx(8), sy(23)), message,
+                  font=_tb_font(int(round(11 * factor)), False, True),
+                  fill=palette["muted"], anchor="lm")
+    image = canvas.resize((width, height), Image.Resampling.LANCZOS)
+
+    # Pass 2: bars and mark at final resolution, so colours stay exact.
+    # 42px of the right column belongs to the percentage (8px margin + the
+    # widest "100%"); the bar gives that up first when the strip is squeezed.
+    track_l = usage_l + 45 * scale
+    track_r = min(usage_l + 104 * scale, width - 50 * scale)
+    for (label, remaining), center in zip(rows, centers):
+        cy = top + center * scale
+        box = (track_l, cy - 2 * scale, track_r, cy + 2 * scale)
+        if track_r > track_l:
+            _tb_capsule(image, box, palette["track"])
+            fill_r = track_l + (track_r - track_l) * max(0.0, remaining) / 100.0
+            if fill_r > track_l:
+                _tb_capsule(image, (track_l, box[1], fill_r, box[3]),
+                            _tb_severity(remaining, palette))
+    mark = _tb_mark(19 * scale)
+    image.alpha_composite(
+        mark,
+        ((mark_box[0] + mark_box[2] - mark.width) // 2,
+         (mark_box[1] + mark_box[3] - mark.height) // 2))
+    dot = max(2.0, 5 * scale)
+    dot_r = mark_box[2] - 7 * scale
+    dot_b = mark_box[3] - 7 * scale
+    _tb_capsule(image, (dot_r - dot, dot_b - dot, dot_r, dot_b),
+                palette["amber"] if stale else palette["green"])
+
+    # Layered windows hit-test on alpha: a fully transparent pixel passes the
+    # click through to the taskbar. Floor the whole surface at alpha 1.
+    floor = Image.new("L", image.size)
+    ImageDraw.Draw(floor).rounded_rectangle(
+        (0, top, width - 1, top + min(height, int(round(_TB_HEIGHT * scale))) - 1),
+        radius=int(round(7 * scale)), fill=1)
+    image.putalpha(ImageChops.lighter(image.getchannel("A"), floor))
+    return image
+
+
+def _tb_premultiplied_bgra(image):
+    """Straight-alpha RGBA -> premultiplied BGRA for AC_SRC_ALPHA blending."""
+    source = image.convert("RGBA").tobytes("raw", "RGBA")
+    out = bytearray(len(source))
+    for i in range(0, len(source), 4):
+        r, g, b, a = source[i:i + 4]
+        out[i] = b * a // 255
+        out[i + 1] = g * a // 255
+        out[i + 2] = r * a // 255
+        out[i + 3] = a
+    return bytes(out)
+
+
+def _tb_publish(hwnd, image):
+    """Publish one per-pixel-alpha frame, releasing every temporary GDI handle."""
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return
+    u, g = _tb_u32(), _tb_g32()
+    screen_dc = u.GetDC(None)
+    if not screen_dc:
+        raise ctypes.WinError(ctypes.get_last_error())
+    memory_dc = g.CreateCompatibleDC(screen_dc)
+    if not memory_dc:
+        u.ReleaseDC(None, screen_dc)
+        raise ctypes.WinError(ctypes.get_last_error())
+    bits = ctypes.c_void_p()
+    info = _TB_BITMAPINFO(bmiHeader=_TB_BITMAPINFOHEADER(
+        biSize=ctypes.sizeof(_TB_BITMAPINFOHEADER), biWidth=width,
+        biHeight=-height, biPlanes=1, biBitCount=32))
+    bitmap = g.CreateDIBSection(memory_dc, ctypes.byref(info),
+                                 _TB_DIB_RGB_COLORS, ctypes.byref(bits), None, 0)
+    if not bitmap or not bits.value:
+        if bitmap:
+            g.DeleteObject(bitmap)
+        g.DeleteDC(memory_dc)
+        u.ReleaseDC(None, screen_dc)
+        raise ctypes.WinError(ctypes.get_last_error())
+    old = g.SelectObject(memory_dc, bitmap)
+    try:
+        pixels = _tb_premultiplied_bgra(image)
+        ctypes.memmove(bits, pixels, len(pixels))
+        source, size = _TB_POINT(0, 0), _TB_SIZE(width, height)
+        blend = _TB_BLENDFUNCTION(0, 0, 255, _TB_AC_SRC_ALPHA)
+        if not u.UpdateLayeredWindow(hwnd, screen_dc, None, ctypes.byref(size),
+                                      memory_dc, ctypes.byref(source), 0,
+                                      ctypes.byref(blend), _TB_ULW_ALPHA):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        g.SelectObject(memory_dc, old)
+        g.DeleteObject(bitmap)
+        g.DeleteDC(memory_dc)
+        u.ReleaseDC(None, screen_dc)
+
+
+def _tb_light_theme():
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        try:
+            value, _ = winreg.QueryValueEx(key, "SystemUsesLightTheme")
+        finally:
+            winreg.CloseKey(key)
+        return bool(value)
+    except (ImportError, OSError, AttributeError):
+        return False
+
+
+def _tb_high_contrast():
+    value = _TB_HIGHCONTRASTW(cbSize=ctypes.sizeof(_TB_HIGHCONTRASTW))
+    return bool(_tb_u32().SystemParametersInfoW(
+        _TB_SPI_GETHIGHCONTRAST, value.cbSize, ctypes.byref(value), 0)
+        and value.dwFlags & _TB_HCF_HIGHCONTRASTON)
+
+
+def _tb_attach(hwnd, parent, rect, origin):
+    """Reparent into the taskbar, restoring the original state on any failure."""
+    u = _tb_u32()
+    original_style = int(u.GetWindowLongPtrW(hwnd, _TB_GWL_STYLE)) & 0xFFFFFFFF
+    original_parent = int(u.GetParent(hwnd) or 0)
+    child_style = (original_style & ~_TB_WS_POPUP) | _TB_WS_CHILD | _TB_WS_CLIPSIBLINGS
+    try:
+        u.SetWindowLongPtrW(hwnd, _TB_GWL_STYLE, child_style)
+        if int(u.GetWindowLongPtrW(hwnd, _TB_GWL_STYLE)) & 0xFFFFFFFF != child_style:
+            raise OSError
+        u.SetParent(hwnd, parent or None)
+        if int(u.GetParent(hwnd) or 0) != parent:
+            raise OSError
+        _tb_position(hwnd, rect, origin)
+    except OSError:
+        try:
+            u.SetParent(hwnd, original_parent or None)
+            u.SetWindowLongPtrW(hwnd, _TB_GWL_STYLE, original_style)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _tb_position(hwnd, rect, origin):
+    if not _tb_u32().SetWindowPos(
+            hwnd, None, rect[0] - origin[0], rect[1] - origin[1],
+            rect[2] - rect[0], rect[3] - rect[1],
+            _TB_SWP_NOACTIVATE | _TB_SWP_FRAMECHANGED):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+class TaskbarSurface:
+    """A layered child window living inside the real taskbar.
+
+    All native calls run on a private message thread; the taskbar geometry is
+    observed on a second thread because probing UIA from the thread that owns
+    the window would deadlock against the provider."""
+
+    def __init__(self, on_left, on_right):
+        self._on_left = on_left
+        self._on_right = on_right
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._thread = None
+        self._observer = None
+        self._rows = ()
+        self._message = "불러오는 중"
+        self._stale = False
+        self._visible = True
+        self._available = False
+        self._attached = False
+        self._hwnd = 0
+        self._wndproc = None
+        self._target = None
+
+    @property
+    def available(self):
+        with self._lock:
+            return self._available
+
+    @property
+    def attached(self):
+        with self._lock:
+            return self._attached
+
+    def start(self):
+        if sys.platform != "win32" or not _TB_HAS_COMTYPES:
+            return False
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return True
+            self._ready.clear()
+            self._stop = threading.Event()
+            self._thread = threading.Thread(target=self._run, args=(self._stop,),
+                                             name="claude-taskbar", daemon=True)
+            self._thread.start()
+        self._ready.wait(1.0)
+        return self.available
+
+    def update(self, rows, message, stale):
+        with self._lock:
+            state = (tuple(rows), message, bool(stale))
+            if state == (self._rows, self._message, self._stale):
+                return
+            self._rows, self._message, self._stale = state
+            hwnd = self._hwnd
+        if hwnd:
+            _tb_u32().PostMessageW(hwnd, _TB_WM_APP_UPDATE, 0, 0)
+
+    def set_visible(self, visible):
+        with self._lock:
+            if bool(visible) == self._visible:
+                return
+            self._visible = bool(visible)
+            hwnd = self._hwnd
+        if hwnd:
+            _tb_u32().PostMessageW(hwnd, _TB_WM_APP_VISIBILITY, int(visible), 0)
+
+    def stop(self):
+        with self._lock:
+            thread, hwnd = self._thread, self._hwnd
+            self._stop.set()
+        if hwnd:
+            _tb_u32().PostMessageW(hwnd, _TB_WM_APP_STOP, 0, 0)
+        if thread is not None and thread.ident != threading.get_ident():
+            thread.join(timeout=2.0)
+        observer = self._observer
+        if observer is not None and observer.ident != threading.get_ident():
+            observer.join(timeout=0.25)
+        with self._lock:
+            self._thread = self._observer = None
+            self._available = self._attached = False
+            self._hwnd = 0
+
+    # ----- private: message thread -----
+
+    def _run(self, stop):
+        u = _tb_u32()
+        # Keep Win32 and UIA rectangles in one physical coordinate space.
+        u.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        hinstance = kernel32.GetModuleHandleW(None)
+        self._wndproc = _TB_WNDPROC(self._window_proc)
+        wc = _TB_WNDCLASSW(lpfnWndProc=self._wndproc, hInstance=hinstance,
+                            lpszClassName=_TB_CLASS_NAME)
+        atom = hwnd = 0
+        try:
+            atom = int(u.RegisterClassW(ctypes.byref(wc)))
+            if not atom or stop.is_set():
+                return
+            hwnd = int(u.CreateWindowExW(
+                _TB_WS_EX_LAYERED | _TB_WS_EX_NOACTIVATE | _TB_WS_EX_TOOLWINDOW,
+                _TB_CLASS_NAME, "Claude usage", _TB_WS_POPUP,
+                0, 0, 1, 1, None, None, hinstance, None) or 0)
+            if not hwnd or stop.is_set():
+                return
+            with self._lock:
+                self._hwnd = hwnd
+                self._available = True
+            self._set_accessible_name(hwnd)
+            self._observer = threading.Thread(target=self._observe,
+                                               args=(hwnd, stop),
+                                               name="claude-taskbar-observer",
+                                               daemon=True)
+            self._observer.start()
+            self._ready.set()
+            message = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                u.TranslateMessage(ctypes.byref(message))
+                u.DispatchMessageW(ctypes.byref(message))
+        except Exception:
+            return
+        finally:
+            stop.set()
+            if hwnd and u.IsWindow(hwnd):
+                u.DestroyWindow(hwnd)
+            if atom:
+                u.UnregisterClassW(_TB_CLASS_NAME, hinstance)
+            with self._lock:
+                self._available = self._attached = False
+                self._hwnd = 0
+            self._ready.set()
+
+    def _window_proc(self, hwnd, message, wparam, lparam):
+        u = _tb_u32()
+        if message == _TB_WM_PAINT:
+            paint = _TB_PAINTSTRUCT()
+            u.BeginPaint(hwnd, ctypes.byref(paint))
+            u.EndPaint(hwnd, ctypes.byref(paint))
+            return 0
+        if message == _TB_WM_ERASEBKGND:
+            return 1
+        if message in (_TB_WM_LBUTTONUP, _TB_WM_RBUTTONUP):
+            point = wintypes.POINT()
+            u.GetCursorPos(ctypes.byref(point))
+            callback = (self._on_left if message == _TB_WM_LBUTTONUP
+                        else self._on_right)
+            try:
+                callback(point.x, point.y)
+            except Exception:
+                pass
+            return 0
+        if message == _TB_WM_APP_UPDATE:
+            self._set_accessible_name(hwnd)
+            self._paint(hwnd)
+            return 0
+        if message == _TB_WM_APP_VISIBILITY:
+            self._apply_visibility()
+            return 0
+        if message == _TB_WM_APP_LAYOUT:
+            self._apply_target()
+            return 0
+        if message == _TB_WM_APP_STOP:
+            u.DestroyWindow(hwnd)
+            return 0
+        if message == _TB_WM_DESTROY:
+            u.PostQuitMessage(0)
+            return 0
+        return u.DefWindowProcW(hwnd, message, wparam, lparam)
+
+    def _set_accessible_name(self, hwnd):
+        with self._lock:
+            rows, message = self._rows, self._message
+        parts = ["Claude"]
+        parts.extend(f"{label} {_tb_percent_text(value)} 남음"
+                     for label, value in rows)
+        if not rows:
+            parts.append(message)
+        _tb_u32().SetWindowTextW(hwnd, ", ".join(parts))
+
+    def _paint(self, hwnd):
+        u = _tb_u32()
+        try:
+            bounds = _TB_RECT()
+            if not u.GetClientRect(hwnd, ctypes.byref(bounds)):
+                return
+            with self._lock:
+                rows, message, stale = self._rows, self._message, self._stale
+            _tb_publish(hwnd, _tb_render(
+                rows, message, stale, bounds.right, bounds.bottom,
+                max(96, int(u.GetDpiForWindow(hwnd) or 96)),
+                _tb_light_theme(), _tb_high_contrast()))
+        except Exception:
+            with self._lock:
+                self._attached = False
+            u.ShowWindow(hwnd, _TB_SW_HIDE)
+
+    # ----- private: observer thread -----
+
+    def _observe(self, hwnd, stop):
+        _tb_u32().SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        while not stop.is_set():
+            try:
+                target = _tb_find_target(hwnd)
+            except Exception:
+                target = None
+            if stop.is_set():
+                return
+            with self._lock:
+                if stop.is_set() or hwnd != self._hwnd:
+                    return
+                self._target = target
+            if not _tb_u32().PostMessageW(hwnd, _TB_WM_APP_LAYOUT, 0, 0):
+                return
+            if stop.wait(_TB_POLL_MS / 1000.0):
+                return
+
+    def _apply_target(self):
+        u = _tb_u32()
+        with self._lock:
+            hwnd, target = self._hwnd, self._target
+        if not hwnd or target is None:
+            with self._lock:
+                self._attached = False
+            if hwnd:
+                u.ShowWindow(hwnd, _TB_SW_HIDE)
+            return
+        parent, bounds, placement, _ = target
+        attached = int(u.GetParent(hwnd) or 0) == parent
+        if attached:
+            try:
+                _tb_position(hwnd, placement, bounds)
+            except OSError:
+                attached = False
+        else:
+            attached = _tb_attach(hwnd, parent, placement, bounds)
+        with self._lock:
+            self._attached = attached
+        if attached:
+            self._paint(hwnd)
+        self._apply_visibility()
+
+    def _apply_visibility(self):
+        with self._lock:
+            show = self._visible and self._attached
+            hwnd = self._hwnd
+        if hwnd:
+            _tb_u32().ShowWindow(
+                hwnd, _TB_SW_SHOWNOACTIVATE if show else _TB_SW_HIDE)
+
+
 # ---------------- Config ----------------
 
 def load_config():
@@ -5528,6 +6476,8 @@ class Widget:
         self._login_poll_attempts = 0
         self.minimized = bool(self.cfg.get("minimized"))
         self._mini_pcts = (0.0, 0.0, 0.0)
+        self.taskbar = None
+        self._taskbar_events = queue.Queue()
 
         self.root = tk.Tk()
 
@@ -5598,6 +6548,7 @@ class Widget:
         self.root.after(80, _post_map_win32)
 
         self._setup_tray()
+        self._setup_taskbar()
 
         self.refresh()
         self._schedule_refresh()
@@ -6071,6 +7022,12 @@ class Widget:
         self.menu.add_checkbutton(label="스마트 포지션 스위칭",
                                    variable=self.smart_var,
                                    command=self._toggle_smart)
+        self.taskbar_var = tk.BooleanVar(
+            value=bool(self.cfg.get("taskbar_visible", True)))
+        self.menu.add_checkbutton(label="작업표시줄 표시",
+                                   variable=self.taskbar_var,
+                                   command=self._toggle_taskbar)
+        self._taskbar_menu_index = self.menu.index("end")
         self.menu.add_command(label="플랜 이름 변경", command=self._prompt_plan)
         self.menu.add_command(label="새로고침 간격 변경", command=self._prompt_interval)
         self.auto_update_var = tk.BooleanVar(value=bool(self.cfg.get("auto_update", True)))
@@ -6101,7 +7058,26 @@ class Widget:
         self.menu.add_separator()
         self.menu.add_command(label=f"버전 v{__version__}", state="disabled")
         self.menu.add_command(label="종료", command=self.quit)
-        self.root.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
+        self.root.bind("<Button-3>", lambda e: self._popup_menu(e.x_root, e.y_root))
+
+    def _popup_menu(self, x, y):
+        """Show the context menu, re-syncing live state first.
+
+        Also serves the embedded taskbar strip's right click, which can arrive
+        while the desktop window is withdrawn."""
+        alive = self.taskbar is not None and self.taskbar.available
+        self.taskbar_var.set(bool(self.cfg.get("taskbar_visible", True)) and alive)
+        try:
+            self.menu.entryconfigure(
+                self._taskbar_menu_index,
+                state="normal" if alive else "disabled",
+                label="작업표시줄 표시" if alive else "작업표시줄 표시 (사용 불가)")
+        except Exception:
+            pass
+        try:
+            self.menu.tk_popup(x, y)
+        finally:
+            self.menu.grab_release()
 
     def _set_ui_scale(self, scale):
         """Persist a new UI scale and re-launch so tk.scaling can apply
@@ -6340,6 +7316,8 @@ class Widget:
             else:
                 self._consec_429 = 0
             self.footer_lbl.config(text=err or "데이터 없음", fg=self.theme["danger"])
+            # Keep the last good numbers on the taskbar strip, amber dot.
+            self._taskbar_update(message=err or "데이터 없음", stale=True)
             return
         # Success path — cancel any pending unlock-refresh, nothing to retry.
         self._cancel_unlock_refresh()
@@ -6390,6 +7368,8 @@ class Widget:
         # keep the battery strip in sync
         self._mini_pcts = (s_pct, w_pct, ss_pct)
         self._draw_mini()
+        # taskbar strip shows only the 5h session and the weekly limit
+        self._taskbar_update(s_pct, w_pct)
 
     def _schedule_refresh(self):
         # Always schedule at the configured interval — no backoff, no
@@ -6526,6 +7506,66 @@ class Widget:
         except Exception:
             self.tray_icon = None
 
+    # ----- Taskbar strip -----
+
+    def _setup_taskbar(self):
+        """Bring up the embedded taskbar surface, or silently do without it."""
+        if sys.platform != "win32" or not _TB_HAS_COMTYPES:
+            return
+        try:
+            surface = TaskbarSurface(
+                lambda x, y: self._taskbar_events.put(("left", x, y)),
+                lambda x, y: self._taskbar_events.put(("right", x, y)))
+            if not surface.start():
+                surface.stop()
+                return
+        except Exception:
+            return
+        self.taskbar = surface
+        surface.set_visible(bool(self.cfg.get("taskbar_visible", True)))
+        self.root.after(120, self._taskbar_pump)
+
+    def _taskbar_pump(self):
+        """Drain clicks from the native thread onto the Tcl thread.
+
+        tkinter calls are not safe from another thread, so the window proc
+        only enqueues and this poll does the actual UI work."""
+        while True:
+            try:
+                kind, x, y = self._taskbar_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if kind == "left":
+                    self._toggle_visibility()
+                else:
+                    self._popup_menu(x, y)
+            except Exception:
+                pass
+        self.root.after(120, self._taskbar_pump)
+
+    def _taskbar_update(self, session_pct=None, weekly_pct=None,
+                        message=None, stale=False):
+        """Push new values, or flag the existing ones stale on a failed poll."""
+        if self.taskbar is None:
+            return
+        if session_pct is None or weekly_pct is None:
+            rows = getattr(self, "_taskbar_rows", ())
+        else:
+            rows = (("5h", max(0.0, min(100.0, 100.0 - session_pct))),
+                    ("주간", max(0.0, min(100.0, 100.0 - weekly_pct))))
+            self._taskbar_rows = rows
+        try:
+            self.taskbar.update(rows, message or "불러오는 중", stale)
+        except Exception:
+            pass
+
+    def _toggle_taskbar(self):
+        self.cfg["taskbar_visible"] = bool(self.taskbar_var.get())
+        save_config(self.cfg)
+        if self.taskbar is not None:
+            self.taskbar.set_visible(self.cfg["taskbar_visible"])
+
     def _tray_toggle(self):
         self.root.after(0, self._toggle_visibility)
 
@@ -6554,6 +7594,11 @@ class Widget:
 
     def quit(self):
         save_config(self.cfg)
+        if getattr(self, "taskbar", None):
+            try:
+                self.taskbar.stop()
+            except Exception:
+                pass
         if getattr(self, "tray_icon", None):
             try:
                 self.tray_icon.stop()
