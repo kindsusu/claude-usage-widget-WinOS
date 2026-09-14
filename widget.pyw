@@ -5453,16 +5453,14 @@ def _tb_lp(value, dpi):
     return max(1, (value * max(96, dpi) + 48) // 96)
 
 
-def _tb_place(taskbar, notify, occupied, regions, dpi, siblings=()):
-    """Pick unused taskbar space.
+def _tb_place(taskbar, notify, _occupied, regions, dpi, siblings=()):
+    """Pick the first safe taskbar run from left to right.
 
-    With a sibling usage strip on the bar (the Codex widget lives on the left)
-    we sweep the free runs left to right and take the first one that fits, so
-    this strip lands beside its sibling instead of across the bar. `regions`
-    carries the taskbar buttons AND the sibling rects, so no run overlaps
-    anything. Without a sibling we keep the original run before the tray
-    icons — grabbing the single left gap first would evict the Codex strip,
-    which needs its full width and cannot fall back to the tray run.
+    Starting after a small edge margin, sweep every real UIA button and sibling
+    usage strip as an obstacle. UI Automation is authoritative for the Widgets
+    button too: a fixed leading reservation wastes valid space on layouts where
+    Windows places its controls elsewhere. The first full-width run wins,
+    regardless of whether a sibling is present.
     """
     tl, tt, tr, tb = taskbar
     tw, th = tr - tl, tb - tt
@@ -5474,33 +5472,25 @@ def _tb_place(taskbar, notify, occupied, regions, dpi, siblings=()):
     gap = _tb_lp(4, dpi)
     pref = _tb_lp(_TB_PREF_W, dpi)
     floor = _tb_lp(_TB_MIN_W, dpi)
+    # `_occupied` and `siblings` remain in the signature for compatibility
+    # with the shared Codex placement contract. `regions` is authoritative:
+    # the caller includes both UIA buttons and sibling strips in it.
+    del _occupied, siblings
+    gap_left = tl + gap
+    ordered = sorted((r for r in regions
+                      if r[2] > r[0] and r[3] > r[1]
+                      and r[0] < notify[0]
+                      and _tb_intersects(r, taskbar)), key=lambda r: r[0])
     left = width = None
-    if siblings:
-        # Windows reserves the leading edge for Widgets even when UIA exposes
-        # no button there, so only search gaps after that conservative bound.
-        gap_left = tl + _tb_lp(200, dpi)
-        beside = {r[2] + gap for r in siblings}
-        ordered = sorted((r for r in regions if r[2] > r[0] and r[3] > r[1]),
-                         key=lambda r: r[0])
-        for region in (*ordered, notify):
-            gap_right = min(tr, region[0] - gap)
-            if gap_right - gap_left >= floor:
-                width = min(pref, gap_right - gap_left)
-                # A run that starts at the sibling strip is the one the user
-                # asked for: sit right against it. Any other run keeps the
-                # original behaviour of hugging the obstacle on its right.
-                left = gap_left if gap_left in beside else gap_right - width
-                break
-            gap_left = max(gap_left, region[2] + gap)
+    for region in (*ordered, notify):
+        gap_right = min(tr, region[0] - gap)
+        if gap_right - gap_left >= floor:
+            width = min(pref, gap_right - gap_left)
+            left = gap_left
+            break
+        gap_left = max(gap_left, min(tr, region[2] + gap))
     if left is None:
-        # No free run on the left: squeeze into the one before the tray icons.
-        right = min(tr, notify[0] - gap)
-        left_edge = tl if occupied is None else max(tl, occupied[2]) + gap
-        available = right - left_edge
-        if available < floor:
-            return None                  # no room: caller silently gives up
-        width = min(pref, available)
-        left = right - width
+        return None                      # no room: caller silently gives up
     top = tt + max(0, (th - height) // 2)
     return (left, top, left + width, top + height)
 
@@ -5510,22 +5500,32 @@ def _tb_selftest():
     bar, notify = (0, 1032, 1920, 1080), (1634, 1032, 1920, 1080)
     buttons = (474, 1032, 1447, 1080)
     sibling = (251, 1033, 448, 1079)     # the Codex strip, on the left
-    # Alone: the run before the tray icons, left to the sibling widget.
+    # No sibling: use the first safe left gap, not the run before the tray.
     alone = _tb_place(bar, notify, buttons, (buttons,), 96)
-    assert alone is not None and alone[0] >= buttons[2], alone
-    # Beside a sibling: the free run next to it, never on top of it.
+    assert alone is not None and alone[0] == 4, alone
+    assert alone[2] <= buttons[0] - 4, alone
+    # A sibling occupying the leading run makes the next first-fit position
+    # exactly adjacent to it (with the shared 4px safety gap).
     wide_bar, wide_notify = (0, 1032, 2560, 1080), (2100, 1032, 2560, 1080)
     wide_buttons = (900, 1032, 2000, 1080)
-    wide_sibling = (200, 1033, 397, 1079)
+    wide_sibling = (4, 1033, 201, 1079)
     beside = _tb_place(wide_bar, wide_notify, (200, 1032, 2000, 1080),
                        (wide_sibling, wide_buttons), 96, (wide_sibling,))
     assert beside is not None and beside[0] == wide_sibling[2] + 4, beside
     assert beside[2] <= wide_buttons[0], beside
-    # Sibling present but nothing fits beside it: back to the tray run.
-    packed = _tb_place(bar, notify, (251, 1032, 1447, 1080),
-                       (sibling, buttons), 96, (sibling,))
-    assert packed is not None and packed[0] >= buttons[2], packed
-    full = (200, 1032, 1630, 1080)
+    # If an earlier gap fits, first-fit wins even when a sibling exists later.
+    later_sibling = (600, 1033, 797, 1079)
+    first = _tb_place(wide_bar, wide_notify, wide_buttons,
+                      (later_sibling, wide_buttons), 96, (later_sibling,))
+    assert first is not None and first[0] == 4, first
+    assert first[2] <= later_sibling[0] - 4, first
+    # The edge margin scales with DPI; UIA regions, rather than a fixed
+    # reservation, identify the actual Widgets control.
+    scaled = _tb_place((0, 1548, 2880, 1620), (2451, 1548, 2880, 1620),
+                       None, ((711, 1548, 2170, 1620),), 144)
+    assert scaled is not None and scaled[0] == 6, scaled
+    # No full-width safe run means no surface; never overlap or squeeze.
+    full = (4, 1032, 1630, 1080)
     assert _tb_place(bar, notify, full, (full,), 96, (sibling,)) is None
     # The bar is short and its colour carries the reading (same thresholds and
     # palette as the Codex strip): 72% green, 38% amber, both inside 12px.
