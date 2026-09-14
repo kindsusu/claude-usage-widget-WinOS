@@ -5459,8 +5459,8 @@ def _tb_place(taskbar, notify, _occupied, regions, dpi, siblings=()):
     Starting after a small edge margin, sweep every real UIA button and sibling
     usage strip as an obstacle. UI Automation is authoritative for the Widgets
     button too: a fixed leading reservation wastes valid space on layouts where
-    Windows places its controls elsewhere. The first full-width run wins,
-    regardless of whether a sibling is present.
+    Windows places its controls elsewhere. The first full-width run wins and
+    the strip is centred within it, regardless of whether a sibling is present.
     """
     tl, tt, tr, tb = taskbar
     tw, th = tr - tl, tb - tt
@@ -5485,8 +5485,9 @@ def _tb_place(taskbar, notify, _occupied, regions, dpi, siblings=()):
     for region in (*ordered, notify):
         gap_right = min(tr, region[0] - gap)
         if gap_right - gap_left >= floor:
-            width = min(pref, gap_right - gap_left)
-            left = gap_left
+            free_width = gap_right - gap_left
+            width = min(pref, free_width)
+            left = gap_left + (free_width - width) // 2
             break
         gap_left = max(gap_left, min(tr, region[2] + gap))
     if left is None:
@@ -5500,30 +5501,27 @@ def _tb_selftest():
     bar, notify = (0, 1032, 1920, 1080), (1634, 1032, 1920, 1080)
     buttons = (474, 1032, 1447, 1080)
     sibling = (251, 1033, 448, 1079)     # the Codex strip, on the left
-    # No sibling: use the first safe left gap, not the run before the tray.
+    # No sibling: centre in the first safe left gap, not before the tray.
     alone = _tb_place(bar, notify, buttons, (buttons,), 96)
-    assert alone is not None and alone[0] == 4, alone
+    assert alone is not None and alone[0] == 156, alone
     assert alone[2] <= buttons[0] - 4, alone
-    # A sibling occupying the leading run makes the next first-fit position
-    # exactly adjacent to it (with the shared 4px safety gap).
+    # A later sibling bounds the first run; centre before it without overlap.
     wide_bar, wide_notify = (0, 1032, 2560, 1080), (2100, 1032, 2560, 1080)
     wide_buttons = (900, 1032, 2000, 1080)
-    wide_sibling = (4, 1033, 201, 1079)
+    wide_sibling = (500, 1033, 697, 1079)
     beside = _tb_place(wide_bar, wide_notify, (200, 1032, 2000, 1080),
                        (wide_sibling, wide_buttons), 96, (wide_sibling,))
-    assert beside is not None and beside[0] == wide_sibling[2] + 4, beside
-    assert beside[2] <= wide_buttons[0], beside
-    # If an earlier gap fits, first-fit wins even when a sibling exists later.
-    later_sibling = (600, 1033, 797, 1079)
-    first = _tb_place(wide_bar, wide_notify, wide_buttons,
-                      (later_sibling, wide_buttons), 96, (later_sibling,))
-    assert first is not None and first[0] == 4, first
-    assert first[2] <= later_sibling[0] - 4, first
-    # The edge margin scales with DPI; UIA regions, rather than a fixed
-    # reservation, identify the actual Widgets control.
-    scaled = _tb_place((0, 1548, 2880, 1620), (2451, 1548, 2880, 1620),
-                       None, ((711, 1548, 2170, 1620),), 144)
-    assert scaled is not None and scaled[0] == 6, scaled
+    assert beside is not None and beside[0] == 169, beside
+    assert beside[2] <= wide_sibling[0] - 4, beside
+    # At 150% DPI, a 6..506 physical-pixel run centres the 242px strip at 135.
+    scaled_bar = (0, 1548, 2560, 1620)
+    scaled_notify = (2200, 1548, 2560, 1620)
+    scaled_sibling = (512, 1549, 808, 1619)
+    scaled = _tb_place(scaled_bar, scaled_notify, scaled_sibling,
+                       (scaled_sibling, (814, 1548, 2100, 1620)), 144,
+                       (scaled_sibling,))
+    assert scaled is not None and scaled[0] == 135, scaled
+    assert scaled[2] <= scaled_sibling[0] - 6, scaled
     # No full-width safe run means no surface; never overlap or squeeze.
     full = (4, 1032, 1630, 1080)
     assert _tb_place(bar, notify, full, (full,), 96, (sibling,)) is None
