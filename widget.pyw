@@ -5071,6 +5071,34 @@ _user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
 _user32.SetWindowLongW.restype = ctypes.c_long
 
 
+def claim_foreground(hwnd):
+    """Make `hwnd` the foreground window despite Windows' foreground lock.
+
+    A right click on the taskbar strip lands on a WS_EX_NOACTIVATE child of
+    Explorer's window, so Explorer (or whatever the user was in) keeps the
+    input queue and a plain SetForegroundWindow is REFUSED. The popup menu
+    then opens with the mouse captured but no keyboard focus: clicking away
+    dismisses it, ESC does not. Attaching this thread to the foreground
+    thread's input queue for the duration of the call is the documented way
+    around the lock. Never raises: worst case the menu behaves as before.
+    """
+    try:
+        foreground = _user32.GetForegroundWindow()
+        owner_tid = (_user32.GetWindowThreadProcessId(ctypes.c_void_p(foreground),
+                                                      None) if foreground else 0)
+        our_tid = _kernel32.GetCurrentThreadId()
+        attached = bool(owner_tid and owner_tid != our_tid
+                        and _user32.AttachThreadInput(owner_tid, our_tid, True))
+        try:
+            _user32.SetForegroundWindow(hwnd)
+            _user32.BringWindowToTop(hwnd)
+        finally:
+            if attached:
+                _user32.AttachThreadInput(owner_tid, our_tid, False)
+    except Exception:
+        pass
+
+
 def hide_from_taskbar(hwnd):
     """Strip WS_EX_APPWINDOW / add WS_EX_TOOLWINDOW so the widget never gets
     a taskbar button. overrideredirect alone is not reliable: Windows re-adds
@@ -5216,15 +5244,20 @@ _TB_RPC_E_CHANGED_MODE = -2147417850
 _TB_MARK_W = 38
 _TB_MARK_H = 44
 _TB_GAP = 5
-_TB_USAGE_W = 154
+# Usage block columns: label | bar | right-aligned %. The bar ran 45..104
+# (59px) until 2026-09-14, when the user asked for 80% of that length; it is
+# now 47px and the severity COLOUR carries the reading. The strip and its
+# shrink floor gave up the same 12px.
+_TB_BAR_L = 45
+_TB_BAR_W = 47                                           # 80% of the old 59
+_TB_PCT_W = 42                                           # widest "100%"
+_TB_PAD_R = 8
+_TB_USAGE_W = _TB_BAR_L + _TB_BAR_W + _TB_PCT_W + _TB_PAD_R      # 142
 _TB_HEIGHT = 46
-_TB_PREF_W = _TB_MARK_W + _TB_GAP + _TB_USAGE_W          # 197
-# Shrink floor. Codex demands its full 197px and vanishes otherwise; a real
-# taskbar with a dozen pinned apps often leaves ~160px next to the tray, so a
-# hard 197 would make the strip blink in and out as apps open and close. The
-# renderer squeezes the progress bar instead — below 150 the bar would be
-# shorter than the label, so that is where we give up.
-_TB_MIN_W = 150
+_TB_PREF_W = _TB_MARK_W + _TB_GAP + _TB_USAGE_W          # 185
+# Shrink floor: the renderer gives up the bar column before the strip itself
+# gives up, so the label and the percentage always stay readable.
+_TB_MIN_W = _TB_PREF_W - _TB_BAR_W                       # 138
 _TB_SS = 3  # supersample factor for text
 
 
@@ -5403,8 +5436,17 @@ def _tb_lp(value, dpi):
     return max(1, (value * max(96, dpi) + 48) // 96)
 
 
-def _tb_place(taskbar, notify, occupied, regions, dpi):
-    """Pick unused taskbar space, preferring the run before the tray icons."""
+def _tb_place(taskbar, notify, occupied, regions, dpi, siblings=()):
+    """Pick unused taskbar space.
+
+    With a sibling usage strip on the bar (the Codex widget lives on the left)
+    we sweep the free runs left to right and take the first one that fits, so
+    this strip lands beside its sibling instead of across the bar. `regions`
+    carries the taskbar buttons AND the sibling rects, so no run overlaps
+    anything. Without a sibling we keep the original run before the tray
+    icons — grabbing the single left gap first would evict the Codex strip,
+    which needs its full width and cannot fall back to the tray run.
+    """
     tl, tt, tr, tb = taskbar
     tw, th = tr - tl, tb - tt
     if th > tw:
@@ -5415,32 +5457,71 @@ def _tb_place(taskbar, notify, occupied, regions, dpi):
     gap = _tb_lp(4, dpi)
     pref = _tb_lp(_TB_PREF_W, dpi)
     floor = _tb_lp(_TB_MIN_W, dpi)
-    right = min(tr, notify[0] - gap)
-    left_edge = tl if occupied is None else max(tl, occupied[2]) + gap
-    available = right - left_edge
-    if available >= floor:
-        width = min(pref, available)
-        left = right - width
-    else:
+    left = width = None
+    if siblings:
         # Windows reserves the leading edge for Widgets even when UIA exposes
         # no button there, so only search gaps after that conservative bound.
         gap_left = tl + _tb_lp(200, dpi)
-        left = None
-        width = pref
+        beside = {r[2] + gap for r in siblings}
         ordered = sorted((r for r in regions if r[2] > r[0] and r[3] > r[1]),
                          key=lambda r: r[0])
         for region in (*ordered, notify):
             gap_right = min(tr, region[0] - gap)
             if gap_right - gap_left >= floor:
                 width = min(pref, gap_right - gap_left)
-                left = gap_right - width
+                # A run that starts at the sibling strip is the one the user
+                # asked for: sit right against it. Any other run keeps the
+                # original behaviour of hugging the obstacle on its right.
+                left = gap_left if gap_left in beside else gap_right - width
                 break
             gap_left = max(gap_left, region[2] + gap)
-        if left is None:
+    if left is None:
+        # No free run on the left: squeeze into the one before the tray icons.
+        right = min(tr, notify[0] - gap)
+        left_edge = tl if occupied is None else max(tl, occupied[2]) + gap
+        available = right - left_edge
+        if available < floor:
             return None                  # no room: caller silently gives up
-        right = left + width
+        width = min(pref, available)
+        left = right - width
     top = tt + max(0, (th - height) // 2)
-    return (left, top, right, top + height)
+    return (left, top, left + width, top + height)
+
+
+def _tb_selftest():
+    """Assert the placement preference order. Run by --selftest."""
+    bar, notify = (0, 1032, 1920, 1080), (1634, 1032, 1920, 1080)
+    buttons = (474, 1032, 1447, 1080)
+    sibling = (251, 1033, 448, 1079)     # the Codex strip, on the left
+    # Alone: the run before the tray icons, left to the sibling widget.
+    alone = _tb_place(bar, notify, buttons, (buttons,), 96)
+    assert alone is not None and alone[0] >= buttons[2], alone
+    # Beside a sibling: the free run next to it, never on top of it.
+    wide_bar, wide_notify = (0, 1032, 2560, 1080), (2100, 1032, 2560, 1080)
+    wide_buttons = (900, 1032, 2000, 1080)
+    wide_sibling = (200, 1033, 397, 1079)
+    beside = _tb_place(wide_bar, wide_notify, (200, 1032, 2000, 1080),
+                       (wide_sibling, wide_buttons), 96, (wide_sibling,))
+    assert beside is not None and beside[0] == wide_sibling[2] + 4, beside
+    assert beside[2] <= wide_buttons[0], beside
+    # Sibling present but nothing fits beside it: back to the tray run.
+    packed = _tb_place(bar, notify, (251, 1032, 1447, 1080),
+                       (sibling, buttons), 96, (sibling,))
+    assert packed is not None and packed[0] >= buttons[2], packed
+    full = (200, 1032, 1630, 1080)
+    assert _tb_place(bar, notify, full, (full,), 96, (sibling,)) is None
+    # The bar is short and its colour carries the reading (same thresholds and
+    # palette as the Codex strip): 72% green, 38% amber, both inside 12px.
+    image = _tb_render((("5h", 72.0), ("주간", 38.0)), "", False,
+                       _TB_PREF_W, _TB_HEIGHT, 96, True, False)
+    usage_l = _TB_MARK_W + _TB_GAP
+    bar_l = usage_l + _TB_BAR_L
+    for colour in ((24, 134, 75), (194, 118, 18), (223, 230, 239)):
+        # scan the usage block only: the mark carries a green freshness dot
+        xs = [x for y in range(image.height) for x in range(usage_l, image.width)
+              if image.getpixel((x, y))[:3] == colour
+              and image.getpixel((x, y))[3] > 200]
+        assert xs and bar_l <= min(xs) and max(xs) <= bar_l + _TB_BAR_W, colour
 
 
 def _tb_window_rect(hwnd):
@@ -5563,11 +5644,12 @@ def _tb_find_target(own_hwnd):
     if not any(name == "Taskbar.TaskListButtonAutomationPeer"
                for name, _ in buttons):
         return None
-    regions = tuple(rect for _, rect in buttons)
-    regions += _tb_sibling_rects(taskbar, own_hwnd)
+    siblings = _tb_sibling_rects(taskbar, own_hwnd)
+    regions = tuple(rect for _, rect in buttons) + siblings
     before = tuple(r for r in regions if r[0] < notify[0])
     dpi = max(96, int(u.GetDpiForWindow(taskbar) or 96))
-    placement = _tb_place(bounds, notify, _tb_union(before), regions, dpi)
+    placement = _tb_place(bounds, notify, _tb_union(before), regions, dpi,
+                          siblings)
     if placement is None:
         return None
     return (taskbar, bounds, placement, dpi)
@@ -5696,7 +5778,8 @@ def _tb_render(rows, message, stale, width, height, dpi, light, high_contrast):
 
     centers = (23.0,) if len(rows) == 1 else (13.5, 32.5)
     if rows:
-        pct_right = min(sx(146), int(round((width - 8 * scale) * _TB_SS)))
+        pct_right = min(sx(_TB_USAGE_W - _TB_PAD_R),
+                        int(round((width - _TB_PAD_R * scale) * _TB_SS)))
         for (label, remaining), center in zip(rows, centers):
             draw.text((sx(8), sy(center)), label,
                       font=_tb_font(int(round(11 * factor)), False, True),
@@ -5711,10 +5794,11 @@ def _tb_render(rows, message, stale, width, height, dpi, light, high_contrast):
     image = canvas.resize((width, height), Image.Resampling.LANCZOS)
 
     # Pass 2: bars and mark at final resolution, so colours stay exact.
-    # 42px of the right column belongs to the percentage (8px margin + the
-    # widest "100%"); the bar gives that up first when the strip is squeezed.
-    track_l = usage_l + 45 * scale
-    track_r = min(usage_l + 104 * scale, width - 50 * scale)
+    # The right column belongs to the percentage (margin + the widest "100%");
+    # the bar gives that up first when the strip is squeezed.
+    track_l = usage_l + _TB_BAR_L * scale
+    track_r = min(usage_l + (_TB_BAR_L + _TB_BAR_W) * scale,
+                  width - (_TB_PCT_W + _TB_PAD_R) * scale)
     for (label, remaining), center in zip(rows, centers):
         cy = top + center * scale
         box = (track_l, cy - 2 * scale, track_r, cy + 2 * scale)
@@ -6884,6 +6968,12 @@ class Widget:
 
     def _toggle_minimize(self):
         self._set_minimized(not self.minimized)
+        # Switching modes is a request to LOOK at the desktop widget, but the
+        # taskbar strip's left click (and the tray) may have withdrawn it.
+        # _set_minimized only re-lays-out, so without this the mode change
+        # reads as "the widget vanished" — the window stays hidden.
+        if not self._visible:
+            self.show_widget()
         # Minimizing/restoring changes the window's footprint (full card vs.
         # battery strip); re-clamp once the new size is laid out.
         self.root.after(50, self._clamp_to_screen)
@@ -7074,10 +7164,21 @@ class Widget:
                 label="작업표시줄 표시" if alive else "작업표시줄 표시 (사용 불가)")
         except Exception:
             pass
+        # tk_popup is TrackPopupMenu on Windows, which only dismisses on an
+        # outside click or ESC while the owning window is the FOREGROUND one.
+        # The taskbar strip is WS_EX_NOACTIVATE, so a right click there leaves
+        # Explorer in front and the menu would stick. Claim the foreground
+        # first (this works even while the root window is withdrawn) and close
+        # the loop with the documented WM_NULL handshake.
+        owner = ctypes.c_void_p(self._hwnd() or 0)
+        if owner.value:
+            claim_foreground(owner)
         try:
             self.menu.tk_popup(x, y)
         finally:
             self.menu.grab_release()
+            if owner.value:
+                _user32.PostMessageW(owner, 0, 0, 0)
 
     def _set_ui_scale(self, scale):
         """Persist a new UI scale and re-launch so tk.scaling can apply
@@ -7619,7 +7720,9 @@ if __name__ == "__main__":
         # Used by the auto-updater (and the release workflow): reaching this
         # line in a fresh interpreter proves every module-level statement —
         # imports, ctypes setup, DPI call — executed without error. No window,
-        # no mutex, no config touched.
+        # no mutex, no config touched. _tb_selftest additionally pins the
+        # taskbar placement preferences (pure geometry, no Win32 calls).
+        _tb_selftest()
         sys.exit(0)
     # Exit silently if another instance already owns the singleton mutex
     # (e.g. the SessionStart hook fired while the widget was already running).
