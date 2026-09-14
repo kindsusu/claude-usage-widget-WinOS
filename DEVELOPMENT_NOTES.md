@@ -71,6 +71,13 @@ anthropic-beta: oauth-2025-04-20
 ## 5. Windows 창 동작
 
 - **작업표시줄 버튼 방지**: `overrideredirect(True)`만으론 불충분 — withdraw/deiconify(트레이 숨김/복원) 후 Windows가 `WS_EX_APPWINDOW`를 다시 붙임. `WS_EX_TOOLWINDOW` 강제 + `APPWINDOW` 제거를 **시작·복원·미니전환 후마다** 재적용.
+
+### 표시 상태 모델
+
+- 데스크톱 위젯은 `desktop_mode` 하나로 `normal` / `mini` / `hidden` 중 정확히 하나만 저장한다.
+- 작업표시줄 위젯은 `taskbar_visible`로 별도 관리하며 데스크톱 상태와 독립적이다.
+- 예전 설정의 `minimized`는 최초 로드 시 `desktop_mode`로 옮기고, 구버전 호환을 위해 이후에도 미러링한다.
+- 작업표시줄을 왼쪽 클릭해 숨긴 뒤 다시 클릭하면 `desktop_restore_mode`에 저장된 마지막 일반/미니 모드로 복원한다.
 - **smart topmost**: 전경 창이 관심 대상일 때만 위로.
   - **자기 자신은 PID(`os.getpid()`)로 식별** — 프로세스명 `pythonw.exe`로 매칭하면 다른 pythonw 앱(코덱스 위젯 등)까지 딸려 올라옴.
   - **터미널 호스트 감지**: cmd/PowerShell/Windows Terminal이 전경이고 그 **자식 프로세스에 claude가 있으면** claude 활성으로 간주 (CreateToolhelp32Snapshot 프로세스 트리). CLI를 터미널에서 돌릴 때도 위로.

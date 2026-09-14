@@ -32,6 +32,7 @@ import tkinter as tk
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image, ImageTk, ImageFont, ImageDraw, ImageChops
@@ -72,6 +73,10 @@ DEFAULT_CONFIG = {
     "pet": None,
     "ui_scale": 1.0,  # baseline; user can override via menu (1.0 / 1.3 / 1.5 / 2.0)
     "minimized": False,  # iPhone-battery mini mode
+    # Exactly one desktop presentation is active: normal / mini / hidden.
+    # ``minimized`` remains mirrored for compatibility with older releases.
+    "desktop_mode": "normal",
+    "desktop_restore_mode": "normal",
     "mini_scale": 1.0,  # independent mini-mode size, adjustable live
     "auto_update": True,  # pull new releases from GitHub and self-restart
     "taskbar_visible": True,  # embedded 2-row strip inside the real taskbar
@@ -5997,6 +6002,25 @@ class TaskbarSurface:
         with self._lock:
             return self._attached
 
+    def screen_rect(self):
+        """Return the live strip rectangle in physical screen coordinates."""
+        with self._lock:
+            hwnd = self._hwnd
+        if not hwnd:
+            return None
+        try:
+            rect = _TB_RECT()
+            if _tb_u32().GetWindowRect(hwnd, ctypes.byref(rect)):
+                return (rect.left, rect.top, rect.right, rect.bottom)
+        except Exception:
+            pass
+        return None
+
+    def contains_screen(self, x, y):
+        """Return whether a screen point is inside the taskbar trigger."""
+        rect = self.screen_rect()
+        return bool(rect and rect[0] <= x < rect[2] and rect[1] <= y < rect[3])
+
     def start(self):
         if sys.platform != "win32" or not _TB_HAS_COMTYPES:
             return False
@@ -6235,14 +6259,29 @@ class TaskbarSurface:
 
 def load_config():
     cfg = DEFAULT_CONFIG.copy()
+    stored = {}
     if CONFIG_PATH.exists():
         try:
-            stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            stored = loaded if isinstance(loaded, dict) else {}
             for k, v in stored.items():
                 if k not in EPHEMERAL_KEYS:
                     cfg[k] = v
         except Exception:
             pass
+    # Migrate the old two-boolean/runtime model. Older builds persisted only
+    # ``minimized``; their hidden state lived in memory and therefore cannot
+    # be recovered after restart. Invalid new values also fall back safely.
+    valid_modes = {"normal", "mini", "hidden"}
+    mode = stored.get("desktop_mode")
+    if mode not in valid_modes:
+        mode = "mini" if bool(cfg.get("minimized")) else "normal"
+    restore = stored.get("desktop_restore_mode")
+    if restore not in {"normal", "mini"}:
+        restore = mode if mode in {"normal", "mini"} else "normal"
+    cfg["desktop_mode"] = mode
+    cfg["desktop_restore_mode"] = restore
+    cfg["minimized"] = mode == "mini"
     return cfg
 
 
@@ -6571,6 +6610,370 @@ def fmt_reset_local(dt):
         return ""
 
 
+# ---------------- Visibility selection panel ----------------
+
+_VIS_WIDTH = 292
+_VIS_HEIGHT = 259
+_VIS_ROW_TOP = 46
+_VIS_ROW_HEIGHT = 40
+_VIS_ROWS = 4
+_VIS_KEY = "#010203"
+
+
+def _visibility_note(mode, taskbar_visible):
+    desktop = {
+        "normal": "일반 위젯",
+        "mini": "미니 위젯",
+        "hidden": "바탕화면 숨김",
+    }.get(mode, "일반 위젯")
+    taskbar = "작업표시줄 표시" if taskbar_visible else "작업표시줄 숨김"
+    return f"{desktop} · {taskbar}"
+
+
+def _visibility_monitor_metrics(x, y):
+    """Return the nearest monitor work area and effective DPI."""
+    if sys.platform != "win32":
+        return None, 96
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        monitor = user32.MonitorFromPoint(
+            wintypes.POINT(int(x), int(y)), _MONITOR_DEFAULTTONEAREST)
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None, 96
+        rect = info.rcWork
+        dpi = 96
+        try:
+            shcore = ctypes.WinDLL("shcore")
+            shcore.GetDpiForMonitor.argtypes = [
+                ctypes.c_void_p, ctypes.c_int,
+                ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT)]
+            shcore.GetDpiForMonitor.restype = ctypes.c_long
+            x_dpi = wintypes.UINT()
+            y_dpi = wintypes.UINT()
+            if shcore.GetDpiForMonitor(
+                    monitor, 0, ctypes.byref(x_dpi), ctypes.byref(y_dpi)) == 0:
+                dpi = max(96, int(x_dpi.value))
+        except Exception:
+            dpi = max(96, round(96 * detect_system_scale()))
+        return (rect.left, rect.top, rect.right, rect.bottom), dpi
+    except Exception:
+        return None, max(96, round(96 * detect_system_scale()))
+
+
+def _visibility_position(x, y, width, height, bounds, avoid=None):
+    """Place the panel above its taskbar anchor without covering the strip."""
+    left, top, right, bottom = bounds
+    px = max(left, min(int(x) - width // 2, right - width))
+    py = max(top, min(int(y) - height - 8, bottom - height))
+    if avoid is not None:
+        al, at, ar, ab = avoid
+        overlaps = px < ar and px + width > al and py < ab and py + height > at
+        if overlaps:
+            above = at - height - 8
+            below = ab + 8
+            py = above if above >= top else min(below, bottom - height)
+    return px, max(top, min(py, bottom - height))
+
+
+@lru_cache(maxsize=24)
+def _visibility_font(size, bold=False):
+    font_name = "malgunbd.ttf" if bold else "malgun.ttf"
+    try:
+        return ImageFont.truetype(Path("C:/Windows/Fonts") / font_name, size)
+    except OSError:
+        return ImageFont.load_default(size=size)
+
+
+def _visibility_panel_image(width, height, theme_name, mode,
+                            taskbar_visible, hover=None,
+                            focus=None, focus_visible=False):
+    """Render the selection card at its final physical size."""
+    scale = width / _VIS_WIDTH
+    supersample = 3
+    rs = scale * supersample
+    rw, rh = width * supersample, height * supersample
+    dark = theme_name == "dark"
+    surface = "#1f2533" if dark else "#f8fafc"
+    text = "#f3f4f6" if dark else "#172033"
+    muted = "#a7b0c0" if dark else "#607089"
+    line = "#3a4354" if dark else "#d8dee8"
+    track = "#343d4e" if dark else "#e8eef5"
+    hover_color = "#2a3242" if dark else "#edf3f8"
+    green = "#25a66a"
+    image = Image.new("RGBA", (rw, rh), surface)
+    draw = ImageDraw.Draw(image)
+
+    def p(value):
+        return round(value * rs)
+
+    draw.rounded_rectangle((0, 0, rw - 1, rh - 1), radius=p(12),
+                           fill=surface, outline=line, width=max(1, p(1)))
+    # Compact Claude mark: the familiar warm radial spark, drawn as geometry
+    # so it stays crisp and never falls back to a platform emoji glyph.
+    cx, cy = p(25), p(27)
+    mark = "#d97757"
+    for dx, dy in ((0, -8), (0, 8), (-8, 0), (8, 0),
+                   (-6, -6), (6, -6), (-6, 6), (6, 6)):
+        draw.line((cx + p(dx * .45), cy + p(dy * .45),
+                   cx + p(dx), cy + p(dy)), fill=mark, width=max(2, p(2)))
+    draw.ellipse((cx - p(3), cy - p(3), cx + p(3), cy + p(3)), fill=mark)
+    draw.text((p(40), p(27)), "Claude 사용량",
+              font=_visibility_font(max(1, p(12)), True), fill=muted, anchor="lm")
+
+    rows = (
+        ("바탕화면 일반 모드", mode == "normal", True),
+        ("바탕화면 미니 모드", mode == "mini", True),
+        ("바탕화면 숨기기", mode == "hidden", True),
+        ("작업표시줄 위젯 표시", bool(taskbar_visible), False),
+    )
+    for index, (label, checked, radio) in enumerate(rows):
+        row_top = _VIS_ROW_TOP + index * _VIS_ROW_HEIGHT
+        if hover == index:
+            draw.rounded_rectangle((p(8), p(row_top), rw - p(8),
+                                    p(row_top + _VIS_ROW_HEIGHT)),
+                                   radius=p(7), fill=hover_color)
+        if focus_visible and focus == index:
+            draw.rounded_rectangle((p(9), p(row_top + 1), rw - p(9),
+                                    p(row_top + _VIS_ROW_HEIGHT - 1)),
+                                   radius=p(7), outline=green,
+                                   width=max(1, p(1)))
+        x1, y1, size = p(17), p(row_top + 12), p(16)
+        box = (x1, y1, x1 + size, y1 + size)
+        if radio:
+            draw.ellipse(box, fill=track, outline=green if checked else muted,
+                         width=max(1, p(1)))
+            if checked:
+                inset = p(4)
+                draw.ellipse((x1 + inset, y1 + inset,
+                              x1 + size - inset, y1 + size - inset), fill=green)
+        else:
+            draw.rounded_rectangle(box, radius=max(1, p(2)),
+                                   fill=green if checked else track,
+                                   outline=green if checked else muted,
+                                   width=max(1, p(1)))
+            if checked:
+                draw.line((x1 + p(3), y1 + p(8), x1 + p(7), y1 + p(12),
+                           x1 + p(13), y1 + p(4)), fill=surface,
+                          width=max(2, p(2)), joint="curve")
+        draw.text((p(43), p(row_top + 20)), label,
+                  font=_visibility_font(max(1, p(13))), fill=text, anchor="lm")
+    draw.line((p(17), p(211), rw - p(17), p(211)), fill=line, width=max(1, p(1)))
+    draw.text((p(17), p(234)), _visibility_note(mode, taskbar_visible),
+              font=_visibility_font(max(1, p(11))), fill=muted, anchor="lm")
+
+    image = image.resize((width, height), Image.Resampling.LANCZOS)
+    mask = Image.new("L", (width, height))
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1),
+                                           radius=max(1, round(12 * scale)), fill=255)
+    image.putalpha(mask)
+    return image
+
+
+class ClaudeVisibilityPanel:
+    """Single non-modal taskbar visibility panel owned by the Tk thread."""
+
+    def __init__(self, root, on_mode, on_taskbar, trigger_contains, on_context):
+        self.root = root
+        self.on_mode = on_mode
+        self.on_taskbar = on_taskbar
+        self.trigger_contains = trigger_contains
+        self.on_context = on_context
+        self.window = None
+        self.canvas = None
+        self.photo = None
+        self.config = None
+        self.hover = None
+        self.focus_row = 0
+        self.focus_visible = False
+
+    @property
+    def open(self):
+        try:
+            return self.window is not None and bool(self.window.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def toggle(self, x, y, config, theme_name, avoid=None):
+        if self.open:
+            self.close()
+            return
+        self.config = config
+        mode = config.get("desktop_mode", "normal")
+        self.focus_row = {"normal": 0, "mini": 1, "hidden": 2}.get(mode, 0)
+        self.focus_visible = False
+        bounds, dpi = _visibility_monitor_metrics(x, y)
+        if bounds is None:
+            vx, vy = self.root.winfo_vrootx(), self.root.winfo_vrooty()
+            vw = self.root.winfo_vrootwidth() or self.root.winfo_screenwidth()
+            vh = self.root.winfo_vrootheight() or self.root.winfo_screenheight()
+            bounds = (vx, vy, vx + vw, vy + vh)
+        scale = max(96, dpi) / 96
+        width, height = round(_VIS_WIDTH * scale), round(_VIS_HEIGHT * scale)
+        window = tk.Toplevel(self.root)
+        self.window = window
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.attributes("-transparentcolor", _VIS_KEY)
+        window.configure(bg=_VIS_KEY)
+        window.resizable(False, False)
+        canvas = tk.Canvas(window, width=width, height=height, bg=_VIS_KEY,
+                           highlightthickness=0, bd=0, takefocus=1)
+        self.canvas = canvas
+        canvas.pack()
+        canvas.bind("<Motion>", self._motion)
+        canvas.bind("<Leave>", self._leave)
+        canvas.bind("<ButtonRelease-1>", self._click)
+        canvas.bind("<Button-3>", self._right_click)
+        for key in ("<Up>", "<Left>", "<Shift-Tab>"):
+            canvas.bind(key, lambda _e, step=-1: self._move_focus(step))
+        for key in ("<Down>", "<Right>", "<Tab>"):
+            canvas.bind(key, lambda _e, step=1: self._move_focus(step))
+        for key in ("<Return>", "<space>"):
+            canvas.bind(key, self._activate_focus)
+        window.bind("<Escape>", lambda _e: self.close())
+        window.bind("<FocusOut>", self._focus_out)
+        px, py = _visibility_position(x, y, width, height, bounds, avoid)
+        window.geometry(f"{width}x{height}{px:+d}{py:+d}")
+        self._draw(theme_name)
+        window.update_idletasks()
+        hide_from_taskbar(window.winfo_id())
+        window.after(100, lambda: self._reassert_toolwindow(window))
+        canvas.focus_force()
+
+    def update(self, config, theme_name):
+        self.config = config
+        if self.open:
+            self._draw(theme_name)
+
+    def close(self):
+        window, self.window = self.window, None
+        self.canvas = None
+        self.photo = None
+        self.hover = None
+        if window is not None:
+            try:
+                if window.winfo_exists():
+                    window.destroy()
+            except tk.TclError:
+                pass
+
+    def _draw(self, theme_name=None):
+        if not self.open or self.canvas is None or self.config is None:
+            return
+        if theme_name is None:
+            theme_name = self.config.get("theme", "light")
+        width = int(self.canvas.cget("width"))
+        height = int(self.canvas.cget("height"))
+        image = _visibility_panel_image(
+            width, height, theme_name,
+            self.config.get("desktop_mode", "normal"),
+            self.config.get("taskbar_visible", True),
+            self.hover, self.focus_row, self.focus_visible)
+        self.photo = ImageTk.PhotoImage(image, master=self.canvas)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
+
+    def _row_at(self, y):
+        if self.canvas is None:
+            return None
+        scale = int(self.canvas.cget("width")) / _VIS_WIDTH
+        logical_y = y / scale
+        if _VIS_ROW_TOP <= logical_y < _VIS_ROW_TOP + _VIS_ROWS * _VIS_ROW_HEIGHT:
+            return int((logical_y - _VIS_ROW_TOP) // _VIS_ROW_HEIGHT)
+        return None
+
+    def _motion(self, event):
+        hover = self._row_at(event.y)
+        if hover != self.hover:
+            self.hover = hover
+            self._draw()
+
+    def _leave(self, _event):
+        if self.hover is not None:
+            self.hover = None
+            self._draw()
+
+    def _click(self, event):
+        row = self._row_at(event.y)
+        if row is not None:
+            self.focus_row = row
+            self._activate(row)
+
+    def _move_focus(self, step):
+        self.focus_row = (self.focus_row + step) % _VIS_ROWS
+        self.focus_visible = True
+        self._draw()
+        return "break"
+
+    def _activate_focus(self, _event):
+        self.focus_visible = True
+        self._activate(self.focus_row)
+        return "break"
+
+    def _activate(self, row):
+        if row < 3:
+            self.on_mode(("normal", "mini", "hidden")[row])
+        else:
+            self.on_taskbar()
+
+    def _right_click(self, event):
+        x, y = event.x_root, event.y_root
+        self.close()
+        self.root.after_idle(lambda: self.on_context(x, y))
+
+    def _focus_out(self, _event):
+        window = self.window
+        if window is None:
+            return
+
+        def close_if_outside():
+            if self.window is not window:
+                return
+            try:
+                point = wintypes.POINT()
+                _user32.GetCursorPos(ctypes.byref(point))
+                on_trigger = self.trigger_contains(point.x, point.y)
+                held = int(_user32.GetAsyncKeyState(1)) & 0x8000
+            except Exception:
+                on_trigger = False
+                held = 0
+            if held:
+                window.after(25, close_if_outside)
+                return
+            if on_trigger:
+                # The native WM_LBUTTONUP will enqueue the normal toggle.
+                # Leave this exact panel alive until that event is drained.
+                window.after(200, lambda: self.close() if self.window is window else None)
+                return
+            focused = window.focus_get()
+            if focused is None or focused.winfo_toplevel() is not window:
+                self.close()
+
+        window.after_idle(close_if_outside)
+
+    def _reassert_toolwindow(self, window):
+        if self.window is window and window.winfo_exists():
+            hide_from_taskbar(window.winfo_id())
+
+
+def _visibility_selftest():
+    """Pin the panel's state labels, geometry and renderer contract."""
+    assert _visibility_note("normal", True) == "일반 위젯 · 작업표시줄 표시"
+    assert _visibility_note("mini", False) == "미니 위젯 · 작업표시줄 숨김"
+    assert _visibility_note("hidden", True) == "바탕화면 숨김 · 작업표시줄 표시"
+    assert _visibility_position(500, 1000, 292, 259,
+                                (0, 0, 1920, 1040)) == (354, 733)
+    image = _visibility_panel_image(438, 388, "light", "mini", True)
+    assert image.size == (438, 388) and image.mode == "RGBA"
+    dark = _visibility_panel_image(292, 259, "dark", "hidden", False,
+                                   hover=3, focus=2, focus_visible=True)
+    assert dark.size == (292, 259) and dark.getbbox() == (0, 0, 292, 259)
+
+
 # ---------------- Widget ----------------
 
 class Widget:
@@ -6594,11 +6997,12 @@ class Widget:
         self.theme_name = self.cfg.get("theme", "light")
         self.theme = THEMES.get(self.theme_name, THEMES["light"])
         self._alpha_popup = None
-        self._visible = True
+        self.desktop_mode = self.cfg.get("desktop_mode", "normal")
+        self._visible = self.desktop_mode != "hidden"
         self.tray_icon = None
         self._login_dialog = None
         self._login_poll_attempts = 0
-        self.minimized = bool(self.cfg.get("minimized"))
+        self.minimized = self.desktop_mode == "mini"
         self._mini_pcts = (0.0, 0.0, 0.0)
         self.taskbar = None
         self._taskbar_events = queue.Queue()
@@ -6656,11 +7060,18 @@ class Widget:
         self._apply_theme()
         self._bind_drag()
         self._bind_menu()
+        self._visibility_panel = ClaudeVisibilityPanel(
+            self.root,
+            self._visibility_select_mode,
+            self._visibility_toggle_taskbar,
+            self._taskbar_contains_screen,
+            self._popup_menu,
+        )
         self.root.bind_all("<Button-1>", self._on_global_click, add="+")
         # Double-click the mini strip restores the full card.
         self.root.bind("<Double-Button-1>", self._on_double_click, add="+")
-        if self.minimized:
-            self._set_minimized(True, save=False)
+        # This also persists the one-time migration from legacy ``minimized``.
+        self._set_desktop_mode(self.desktop_mode, save=True)
 
         def _post_map_win32():
             set_window_zorder(self._hwnd(), "top")
@@ -6969,8 +7380,9 @@ class Widget:
         MINI_TRANS_KEY_DARK is retained for reference/fallback."""
         return MINI_TRANS_KEY_LIGHT
 
-    def _set_minimized(self, flag, save=True):
-        self.minimized = bool(flag)
+    def _apply_desktop_layout(self, minimized):
+        """Lay out the normal card or mini strip without changing state."""
+        self.minimized = bool(minimized)
         # Always clear any previously-set transparent color key first. Older
         # builds keyed the strip out via -transparentcolor and may have saved
         # minimized=True; this guarantees the opaque strip renders normally.
@@ -7000,23 +7412,52 @@ class Widget:
             self.outer.pack()
         # attribute churn above can re-add the taskbar button
         hide_from_taskbar(self._hwnd())
-        if save:
-            self.cfg["minimized"] = self.minimized
-            save_config(self.cfg)
         if hasattr(self, "mini_var"):
             self.mini_var.set(self.minimized)
 
+    def _set_desktop_mode(self, mode, save=True):
+        """Apply one exclusive desktop mode and keep legacy config in sync."""
+        if mode not in {"normal", "mini", "hidden"}:
+            mode = "normal"
+
+        previous = getattr(self, "desktop_mode", "normal")
+        if mode == "hidden":
+            if previous in {"normal", "mini"}:
+                self.cfg["desktop_restore_mode"] = previous
+            # Leave a deterministic normal layout behind the withdrawn root.
+            # This also makes the legacy minimized flag unambiguous.
+            self._apply_desktop_layout(False)
+            self.root.withdraw()
+            self._visible = False
+        else:
+            self.cfg["desktop_restore_mode"] = mode
+            self._apply_desktop_layout(mode == "mini")
+            self.root.deiconify()
+            self._visible = True
+            self.root.attributes("-topmost", True)
+            set_window_zorder(self._hwnd(), "top")
+            self._current_z = "top"
+            hide_from_taskbar(self._hwnd())
+            self.root.after(50, self._clamp_to_screen)
+
+        self.desktop_mode = mode
+        self.cfg["desktop_mode"] = mode
+        self.cfg["minimized"] = mode == "mini"
+        if hasattr(self, "desktop_mode_var"):
+            self.desktop_mode_var.set(mode)
+        if hasattr(self, "mini_var"):
+            self.mini_var.set(mode == "mini")
+        if hasattr(self, "_visibility_panel"):
+            self._visibility_panel.update(self.cfg, self.theme_name)
+        if save:
+            save_config(self.cfg)
+
+    def _set_minimized(self, flag, save=True):
+        """Compatibility wrapper used by existing mini controls."""
+        self._set_desktop_mode("mini" if flag else "normal", save=save)
+
     def _toggle_minimize(self):
-        self._set_minimized(not self.minimized)
-        # Switching modes is a request to LOOK at the desktop widget, but the
-        # taskbar strip's left click (and the tray) may have withdrawn it.
-        # _set_minimized only re-lays-out, so without this the mode change
-        # reads as "the widget vanished" — the window stays hidden.
-        if not self._visible:
-            self.show_widget()
-        # Minimizing/restoring changes the window's footprint (full card vs.
-        # battery strip); re-clamp once the new size is laid out.
-        self.root.after(50, self._clamp_to_screen)
+        self._set_desktop_mode("normal" if self.desktop_mode == "mini" else "mini")
 
     def _on_double_click(self, _e):
         if self.minimized:
@@ -7028,6 +7469,8 @@ class Widget:
         self.cfg["theme"] = self.theme_name
         save_config(self.cfg)
         self._apply_theme()
+        if hasattr(self, "_visibility_panel"):
+            self._visibility_panel.update(self.cfg, self.theme_name)
         # While minimized, re-run the minimize path so the NEW theme's
         # transparent key is applied to the bgs and -transparentcolor;
         # otherwise old-key pixels stay opaque as a colored slab.
@@ -7037,6 +7480,8 @@ class Widget:
             self._render(self._last_data, None)
 
     def _toggle_alpha_popup(self):
+        if hasattr(self, "_visibility_panel"):
+            self._visibility_panel.close()
         if self._alpha_popup is not None and self._alpha_popup.winfo_exists():
             self._close_alpha_popup()
             return
@@ -7144,9 +7589,18 @@ class Widget:
         self.menu.add_command(label="지금 새로고침", command=self.refresh)
         self.menu.add_separator()
         self.mini_var = tk.BooleanVar(value=self.minimized)
-        self.menu.add_checkbutton(label="미니 모드 (배터리)",
-                                   variable=self.mini_var,
-                                   command=self._toggle_minimize)
+        self.desktop_mode_var = tk.StringVar(value=self.desktop_mode)
+        desktop_menu = tk.Menu(self.menu, tearoff=0, font=menu_font)
+        for label, value in (("일반 모드", "normal"),
+                             ("미니 모드", "mini"),
+                             ("숨기기", "hidden")):
+            desktop_menu.add_radiobutton(
+                label=label,
+                variable=self.desktop_mode_var,
+                value=value,
+                command=self._select_desktop_mode,
+            )
+        self.menu.add_cascade(label="데스크톱 위젯", menu=desktop_menu)
         self.menu.add_command(label="다크/라이트 전환", command=self._toggle_theme)
         self.smart_var = tk.BooleanVar(value=self.cfg.get("smart_topmost", True))
         self.menu.add_checkbutton(label="스마트 포지션 스위칭",
@@ -7195,12 +7649,16 @@ class Widget:
 
         Also serves the embedded taskbar strip's right click, which can arrive
         while the desktop window is withdrawn."""
+        if hasattr(self, "_visibility_panel"):
+            self._visibility_panel.close()
+        self._close_alpha_popup()
         alive = self.taskbar is not None and self.taskbar.available
-        self.taskbar_var.set(bool(self.cfg.get("taskbar_visible", True)) and alive)
+        self.desktop_mode_var.set(self.desktop_mode)
+        self.taskbar_var.set(bool(self.cfg.get("taskbar_visible", True)))
         try:
             self.menu.entryconfigure(
                 self._taskbar_menu_index,
-                state="normal" if alive else "disabled",
+                state="normal",
                 label="작업표시줄 표시" if alive else "작업표시줄 표시 (사용 불가)")
         except Exception:
             pass
@@ -7219,6 +7677,9 @@ class Widget:
             self.menu.grab_release()
             if owner.value:
                 _user32.PostMessageW(owner, 0, 0, 0)
+
+    def _select_desktop_mode(self):
+        self._set_desktop_mode(self.desktop_mode_var.get())
 
     def _set_ui_scale(self, scale):
         """Persist a new UI scale and re-launch so tk.scaling can apply
@@ -7678,7 +8139,7 @@ class Widget:
                 break
             try:
                 if kind == "left":
-                    self._toggle_visibility()
+                    self._show_visibility_panel(x, y)
                 else:
                     self._popup_menu(x, y)
             except Exception:
@@ -7706,35 +8167,47 @@ class Widget:
         save_config(self.cfg)
         if self.taskbar is not None:
             self.taskbar.set_visible(self.cfg["taskbar_visible"])
+        if hasattr(self, "_visibility_panel"):
+            self._visibility_panel.update(self.cfg, self.theme_name)
+
+    def _taskbar_contains_screen(self, x, y):
+        return bool(self.taskbar is not None and self.taskbar.contains_screen(x, y))
+
+    def _show_visibility_panel(self, x, y):
+        """Toggle the taskbar's compact surface selector."""
+        self._close_alpha_popup()
+        avoid = self.taskbar.screen_rect() if self.taskbar is not None else None
+        self._visibility_panel.toggle(x, y, self.cfg, self.theme_name, avoid)
+
+    def _visibility_select_mode(self, mode):
+        self._set_desktop_mode(mode)
+
+    def _visibility_toggle_taskbar(self):
+        self.taskbar_var.set(not bool(self.cfg.get("taskbar_visible", True)))
+        self._toggle_taskbar()
 
     def _tray_toggle(self):
         self.root.after(0, self._toggle_visibility)
 
     def _toggle_visibility(self):
-        if self._visible:
+        if self.desktop_mode != "hidden":
             self.hide_to_tray()
         else:
             self.show_widget()
 
     def hide_to_tray(self):
-        save_config(self.cfg)
-        self.root.withdraw()
-        self._visible = False
+        self._set_desktop_mode("hidden")
 
     def show_widget(self):
-        self.root.deiconify()
-        self._visible = True
-        self.root.attributes("-topmost", True)
-        set_window_zorder(self._hwnd(), "top")
-        self._current_z = "top"
-        # deiconify is the main trigger for Windows re-adding a taskbar button
-        hide_from_taskbar(self._hwnd())
-        # The screen setup (monitor count/resolution) may have changed while
-        # hidden in the tray; re-clamp once the restored window is laid out.
-        self.root.after(50, self._clamp_to_screen)
+        mode = self.cfg.get("desktop_restore_mode", "normal")
+        if mode not in {"normal", "mini"}:
+            mode = "normal"
+        self._set_desktop_mode(mode)
 
     def quit(self):
         save_config(self.cfg)
+        if hasattr(self, "_visibility_panel"):
+            self._visibility_panel.close()
         if getattr(self, "taskbar", None):
             try:
                 self.taskbar.stop()
@@ -7763,6 +8236,7 @@ if __name__ == "__main__":
         # no mutex, no config touched. _tb_selftest additionally pins the
         # taskbar placement preferences (pure geometry, no Win32 calls).
         _tb_selftest()
+        _visibility_selftest()
         sys.exit(0)
     # Exit silently if another instance already owns the singleton mutex
     # (e.g. the SessionStart hook fired while the widget was already running).
