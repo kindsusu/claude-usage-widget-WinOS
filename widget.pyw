@@ -5254,6 +5254,15 @@ _TB_RPC_E_CHANGED_MODE = -2147417850
 _TB_MARK_W = 30
 _TB_MARK_H = 44
 _TB_GAP = 4
+# Left sweep start. Until 2026-09-15 this was a flat 200px "Windows reserves
+# the leading edge for Widgets" rule, which threw away the whole left end of
+# a taskbar that has no Widgets button (measured: nothing between 0 and the
+# Start cluster). Now we only keep a hairline margin and rely on measurement:
+# anything that actually starts inside _TB_LEADING_BAND is treated as an
+# obstacle whatever its UIA control type, so a Widgets surface that is not
+# exposed as a button still cannot be covered.
+_TB_EDGE_MARGIN = 8
+_TB_LEADING_BAND = 200
 # Usage block columns: label | bar | right-aligned %. The bar ran 45..104
 # (59px) until 2026-09-14, when the user asked for 80% of that length; it is
 # now 47px and the severity COLOUR carries the reading.
@@ -5476,9 +5485,9 @@ def _tb_place(taskbar, notify, occupied, regions, dpi, siblings=()):
     floor = _tb_lp(_TB_MIN_W, dpi)
     left = width = None
     if siblings:
-        # Windows reserves the leading edge for Widgets even when UIA exposes
-        # no button there, so only search gaps after that conservative bound.
-        gap_left = tl + _tb_lp(200, dpi)
+        # Start at the very edge: whatever really sits there (a Widgets
+        # surface, a left-aligned Start cluster) arrives in `regions`.
+        gap_left = tl + _tb_lp(_TB_EDGE_MARGIN, dpi)
         beside = {r[2] + gap for r in siblings}
         ordered = sorted((r for r in regions if r[2] > r[0] and r[3] > r[1]),
                          key=lambda r: r[0])
@@ -5513,19 +5522,27 @@ def _tb_selftest():
     # Alone: the run before the tray icons, left to the sibling widget.
     alone = _tb_place(bar, notify, buttons, (buttons,), 96)
     assert alone is not None and alone[0] >= buttons[2], alone
-    # Beside a sibling: the free run next to it, never on top of it.
+    # Beside a sibling that starts at the edge margin: flush against it.
     wide_bar, wide_notify = (0, 1032, 2560, 1080), (2100, 1032, 2560, 1080)
     wide_buttons = (900, 1032, 2000, 1080)
-    wide_sibling = (200, 1033, 397, 1079)
-    beside = _tb_place(wide_bar, wide_notify, (200, 1032, 2000, 1080),
+    wide_sibling = (_TB_EDGE_MARGIN, 1033, _TB_EDGE_MARGIN + 161, 1079)
+    beside = _tb_place(wide_bar, wide_notify, (0, 1032, 2000, 1080),
                        (wide_sibling, wide_buttons), 96, (wide_sibling,))
     assert beside is not None and beside[0] == wide_sibling[2] + 4, beside
     assert beside[2] <= wide_buttons[0], beside
+    # A leading-edge obstacle (e.g. a Widgets surface) pushes the sweep past
+    # it instead of the old flat 200px reserve doing it blindly.
+    widgets = (0, 1032, 120, 1080)
+    after = _tb_place(wide_bar, wide_notify, (0, 1032, 2000, 1080),
+                      (widgets, wide_buttons), 96, (widgets,))
+    assert after is not None and after[0] >= widgets[2], after
     # Sibling present but nothing fits beside it: back to the tray run.
-    packed = _tb_place(bar, notify, (251, 1032, 1447, 1080),
-                       (sibling, buttons), 96, (sibling,))
-    assert packed is not None and packed[0] >= buttons[2], packed
-    full = (200, 1032, 1630, 1080)
+    packed_sibling = (8, 1033, 169, 1079)
+    packed_buttons = (200, 1032, 1447, 1080)
+    packed = _tb_place(bar, notify, (8, 1032, 1447, 1080),
+                       (packed_sibling, packed_buttons), 96, (packed_sibling,))
+    assert packed is not None and packed[0] >= packed_buttons[2], packed
+    full = (0, 1032, 1630, 1080)
     assert _tb_place(bar, notify, full, (full,), 96, (sibling,)) is None
     # The bar is short and its colour carries the reading (same thresholds and
     # palette as the Codex strip): 72% green, 38% amber, both inside 12px.
@@ -5586,8 +5603,14 @@ def _tb_sibling_rects(taskbar, own_hwnd):
     return tuple(found)
 
 
-def _tb_uia_buttons(taskbar, bounds):
-    """(class_name, rect) for every real taskbar button, via UI Automation.
+def _tb_uia_regions(taskbar, bounds):
+    """(class_name, rect) for everything on the bar we must not cover.
+
+    That is every real taskbar button, PLUS anything at all that starts inside
+    the leading band — a Widgets surface is not always exposed as a button, so
+    near the left edge we trust position over control type. Full-bar
+    containers (the frame, the input site) and our own strips are skipped:
+    they would swallow the whole sweep.
 
     Must run on a thread that is NOT the taskbar's own — asking UIA about the
     tree from inside the provider thread deadlocks. Providers live in another
@@ -5614,16 +5637,23 @@ def _tb_uia_buttons(taskbar, bounds):
             interface=UIAutomationClient.IUIAutomation)
         root = automation.ElementFromHandle(taskbar)
         elements = root.FindAll(4, automation.CreateTrueCondition())
+        dpi = max(96, int(_tb_u32().GetDpiForWindow(taskbar) or 96))
+        band = bounds[0] + _tb_lp(_TB_LEADING_BAND, dpi)
+        half = (bounds[2] - bounds[0]) // 2
         found = []
         for index in range(elements.Length):
             element = elements.GetElement(index)
             native = element.CurrentBoundingRectangle
             rect = (round(native.left), round(native.top),
                     round(native.right), round(native.bottom))
-            if (element.CurrentControlType == _TB_UIA_BUTTON
-                    and rect[2] > rect[0] and rect[3] > rect[1]
-                    and _tb_intersects(rect, bounds)):
-                found.append((str(element.CurrentClassName), rect))
+            name = str(element.CurrentClassName)
+            if (rect[2] <= rect[0] or rect[3] <= rect[1]
+                    or not _tb_intersects(rect, bounds)
+                    or name.startswith(_TB_SIBLING_PREFIXES)):
+                continue
+            leading = rect[0] < band and (rect[2] - rect[0]) < half
+            if element.CurrentControlType == _TB_UIA_BUTTON or leading:
+                found.append((name, rect))
         return tuple(found)
     except Exception:
         return ()
@@ -5655,7 +5685,7 @@ def _tb_find_target(own_hwnd):
     notify = _tb_child_rect(taskbar, {"TrayNotifyWnd", "ClockButton"})
     if notify is None:
         return None
-    buttons = _tb_uia_buttons(taskbar, bounds)
+    buttons = _tb_uia_regions(taskbar, bounds)
     # No task-list button means UIA gave us nothing usable (Explorer mid
     # restart, comtypes broken); placing blind would land on top of something.
     if not any(name == "Taskbar.TaskListButtonAutomationPeer"
