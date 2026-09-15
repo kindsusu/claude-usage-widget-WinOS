@@ -6010,6 +6010,21 @@ def _tb_selftest():
               if image.getpixel((x, y))[:3] == colour
               and image.getpixel((x, y))[3] > 200]
         assert xs and bar_l <= min(xs) and max(xs) <= bar_l + _TB_BAR_W, colour
+    # The mark and usage block dispatch independently in physical pixels.
+    regions = _tb_hit_regions(_TB_PREF_W, _TB_HEIGHT, 96)
+    assert regions["icon"] == (0, 1, 30, 45)
+    assert regions["usage"] == (34, 0, 161, 46)
+    assert _tb_region_at(161, 46, 96, 15, 23) == "icon"
+    assert _tb_region_at(161, 46, 96, 33, 23) is None
+    assert _tb_region_at(161, 46, 96, 34, 23) == "usage"
+    scaled = _tb_hit_regions(242, 69, 144)
+    assert scaled["icon"] == (0, 1, 45, 67)
+    assert scaled["usage"] == (51, 0, 242, 69)
+    icon_hover = _tb_render((("5h", 72.0),), "", False,
+                            161, 46, 96, True, False, "icon")
+    usage_hover = _tb_render((("5h", 72.0),), "", False,
+                             161, 46, 96, True, False, "usage")
+    assert icon_hover.tobytes() != usage_hover.tobytes()
 
 
 def _tb_window_rect(hwnd):
@@ -6363,8 +6378,26 @@ def _tb_layout(width, height, dpi):
     return (0, mark_top, mark_w, mark_top + mark_h), mark_w + gap, top, content_h
 
 
+def _tb_hit_regions(width, height, dpi):
+    """Physical-pixel usage/icon targets matching the rendered strip."""
+    mark, usage_left, top, content_height = _tb_layout(width, height, dpi)
+    return {
+        "icon": mark,
+        "usage": (usage_left, top, width, top + content_height),
+    }
+
+
+def _tb_region_at(width, height, dpi, x, y):
+    """Return the taskbar action under one client-coordinate point."""
+    for name, (left, top, right, bottom) in _tb_hit_regions(
+            width, height, dpi).items():
+        if left <= x < right and top <= y < bottom:
+            return name
+    return None
+
+
 def _tb_render(rows, message, stale, width, height, dpi, light, high_contrast,
-               hover=False):
+               hover=None):
     """Render the 2-row taskbar strip as straight-alpha RGBA pixels."""
     width, height = max(1, width), max(1, height)
     dpi = max(96, dpi)
@@ -6376,12 +6409,12 @@ def _tb_render(rows, message, stale, width, height, dpi, light, high_contrast,
     # Pass 1: text only, supersampled then downsampled for clean antialiasing.
     canvas = Image.new("RGBA", (width * _TB_SS, height * _TB_SS))
     draw = ImageDraw.Draw(canvas)
-    if hover:
-        # Same treatment as the Codex strip: a translucent wash under the
-        # content so the user can see the strip is clickable.
+    if hover in {"icon", "usage"}:
+        # Each independently clickable surface gets its own hover wash.
+        region = _tb_hit_regions(width, height, dpi)[hover]
         draw.rounded_rectangle(
-            (0, top * _TB_SS, (width - 1) * _TB_SS,
-             (top + content_h - 1) * _TB_SS),
+            (region[0] * _TB_SS, region[1] * _TB_SS,
+             (region[2] - 1) * _TB_SS, (region[3] - 1) * _TB_SS),
             radius=int(round(7 * factor)), fill=_TB_HOVER_FILL)
 
     def sx(value):
@@ -6618,8 +6651,10 @@ class TaskbarSurface:
     observed on a second thread because probing UIA from the thread that owns
     the window would deadlock against the provider."""
 
-    def __init__(self, on_left, on_right, on_move=None, on_priority=None):
-        self._on_left = on_left
+    def __init__(self, on_details, on_visibility, on_right,
+                 on_move=None, on_priority=None):
+        self._on_details = on_details
+        self._on_visibility = on_visibility
         self._on_right = on_right
         self._on_move = on_move or (lambda *_args: None)
         self._on_priority = on_priority or (lambda *_args: None)
@@ -6635,7 +6670,7 @@ class TaskbarSurface:
         self._visible = True
         self._available = False
         self._attached = False
-        self._hover = False
+        self._hover = None
         self._hwnd = 0
         self._wndproc = None
         self._target = None
@@ -6721,6 +6756,19 @@ class TaskbarSurface:
         """Return whether a screen point is inside the taskbar trigger."""
         rect = self.screen_rect()
         return bool(rect and rect[0] <= x < rect[2] and rect[1] <= y < rect[3])
+
+    def region_contains_screen(self, region, x, y):
+        """Return whether a screen point is inside one rendered action."""
+        rect = self.screen_rect()
+        if not rect:
+            return False
+        local_x, local_y = x - rect[0], y - rect[1]
+        try:
+            dpi = max(96, int(_tb_u32().GetDpiForWindow(self._hwnd) or 96))
+        except Exception:
+            dpi = 96
+        return _tb_region_at(rect[2] - rect[0], rect[3] - rect[1], dpi,
+                             local_x, local_y) == region
 
     def start(self):
         if sys.platform != "win32" or not _TB_HAS_COMTYPES:
@@ -6859,8 +6907,16 @@ class TaskbarSurface:
         if message == _TB_WM_MOUSEMOVE:
             if self._handle_drag_move(hwnd):
                 return 0
-            if not self._hover:
-                self._hover = True
+            bounds = _TB_RECT()
+            local_x = ctypes.c_short(lparam & 0xFFFF).value
+            local_y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+            region = None
+            if u.GetClientRect(hwnd, ctypes.byref(bounds)):
+                dpi = max(96, int(u.GetDpiForWindow(hwnd) or 96))
+                region = _tb_region_at(bounds.right, bounds.bottom, dpi,
+                                       local_x, local_y)
+            if region != self._hover:
+                self._hover = region
                 self._paint(hwnd)
             # Re-arm every move: Windows cancels the leave request each time
             # it fires, and one missed WM_MOUSELEAVE leaves the wash stuck on.
@@ -6870,8 +6926,8 @@ class TaskbarSurface:
             u.TrackMouseEvent(ctypes.byref(track))
             return 0
         if message == _TB_WM_MOUSELEAVE:
-            if self._hover:
-                self._hover = False
+            if self._hover is not None:
+                self._hover = None
                 self._paint(hwnd)
             return 0
         if message in (_TB_WM_LBUTTONUP, _TB_WM_RBUTTONUP):
@@ -6879,8 +6935,21 @@ class TaskbarSurface:
                 return 0                   # it was a drag, not a click
             point = wintypes.POINT()
             u.GetCursorPos(ctypes.byref(point))
-            callback = (self._on_left if message == _TB_WM_LBUTTONUP
-                        else self._on_right)
+            callback = self._on_right
+            if message == _TB_WM_LBUTTONUP:
+                bounds = _TB_RECT()
+                local_x = ctypes.c_short(lparam & 0xFFFF).value
+                local_y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+                if not u.GetClientRect(hwnd, ctypes.byref(bounds)):
+                    return 0
+                dpi = max(96, int(u.GetDpiForWindow(hwnd) or 96))
+                region = _tb_region_at(bounds.right, bounds.bottom, dpi,
+                                       local_x, local_y)
+                callback = (self._on_details if region == "usage"
+                            else self._on_visibility if region == "icon"
+                            else None)
+            if callback is None:
+                return 0
             try:
                 callback(point.x, point.y)
             except Exception:
@@ -7688,6 +7757,162 @@ def fmt_reset_local(dt):
         return ""
 
 
+# ---------------- Taskbar usage details ----------------
+
+_DETAIL_WIDTH = 292
+
+
+def _taskbar_detail_rows(data):
+    """Build the same usage/reset rows shown on the desktop card."""
+    if not data:
+        return ()
+    five = data.get("five_hour") or {}
+    weekly = data.get("seven_day") or {}
+    scoped = data.get("seven_day_sonnet") or {}
+    scoped_label = "Sonnet 주간"
+    scoped_pct = scoped.get("utilization", 0) or 0
+    scoped_reset = parse_iso(scoped.get("resets_at"))
+    for limit in data.get("limits") or ():
+        if limit.get("kind") == "weekly_scoped":
+            model = ((limit.get("scope") or {}).get("model") or {})
+            scoped_label = f"{model.get('display_name') or 'Sonnet'} 주간"
+            scoped_pct = limit.get("percent", 0) or 0
+            scoped_reset = parse_iso(limit.get("resets_at"))
+            break
+
+    def row(label, source, percent=None, reset=None):
+        used = source.get("utilization", 0) if percent is None else percent
+        reset_at = parse_iso(source.get("resets_at")) if reset is None else reset
+        reset_text = f"{fmt_reset_local(reset_at)} 리셋" if reset_at else ""
+        return label, max(0.0, min(100.0, float(used or 0))), reset_text
+
+    return (
+        row("현재 세션", five),
+        row("주간 한도", weekly),
+        row(scoped_label, scoped, scoped_pct, scoped_reset),
+    )
+
+
+class ClaudeTaskbarDetails:
+    """Own one DPI-aware usage popup on Tk's UI thread."""
+
+    def __init__(self, root, trigger_contains, on_context):
+        self.root = root
+        self.trigger_contains = trigger_contains
+        self.on_context = on_context
+        self.window = None
+        self.anchor = (0, 0)
+        self.data = None
+        self.error = None
+        self.theme_name = "light"
+
+    @property
+    def open(self):
+        try:
+            return self.window is not None and bool(self.window.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def toggle(self, x, y, data, error, theme_name):
+        if self.open:
+            self.close()
+            return
+        self.anchor = (x, y)
+        window = tk.Toplevel(self.root)
+        self.window = window
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.resizable(False, False)
+        window.bind("<Escape>", lambda _e: self.close())
+        window.bind("<FocusOut>", self._focus_out)
+        window.bind("<Button-3>", self._right_click)
+        self.update(data, error, theme_name)
+        window.focus_force()
+
+    def update(self, data, error, theme_name):
+        self.data, self.error, self.theme_name = data, error, theme_name
+        if not self.open:
+            return
+        window = self.window
+        theme = THEMES.get(theme_name, THEMES["light"])
+        bounds, dpi = _visibility_monitor_metrics(*self.anchor)
+        scale = max(96, dpi) / 96.0
+        px = lambda value: max(1, round(value * scale))
+        for child in window.winfo_children():
+            child.destroy()
+        window.configure(bg=theme["bg"])
+        shell = tk.Frame(window, bg=theme["bg"], padx=px(12), pady=px(10),
+                         highlightbackground=theme["bar_bg"], highlightthickness=1)
+        shell.pack(fill="both", expand=True)
+        self._label(shell, "Claude 사용량", theme["fg"], px(14), bold=True)
+        rows = _taskbar_detail_rows(data)
+        if rows:
+            for label, used, reset_text in rows:
+                self._label(shell, f"{label}  {used:g}% 사용됨",
+                            theme["fg"], px(12), pady=(px(8), 0))
+                self._label(shell, reset_text, theme["dim"], px(11))
+        else:
+            self._label(shell, error or "Claude 사용량을 확인하는 중…",
+                        theme["dim"], px(12), pady=(px(8), px(3)))
+        status = (f"이전 데이터 · {error}" if error and rows else
+                  error or f"업데이트 {datetime.now().strftime('%H:%M:%S')}")
+        self._label(shell, status, theme["muted"], px(11), pady=(px(9), 0))
+        window.update_idletasks()
+        width, height = px(_DETAIL_WIDTH), window.winfo_reqheight()
+        if bounds is None:
+            left, top = self.root.winfo_vrootx(), self.root.winfo_vrooty()
+            bounds = (left, top, left + self.root.winfo_vrootwidth(),
+                      top + self.root.winfo_vrootheight())
+        x, y = _visibility_position(*self.anchor, width, height, bounds)
+        window.geometry(f"{width}x{height}{x:+d}{y:+d}")
+        hide_from_taskbar(window.winfo_id())
+
+    def close(self):
+        window, self.window = self.window, None
+        if window is not None:
+            try:
+                if window.winfo_exists():
+                    window.destroy()
+            except tk.TclError:
+                pass
+
+    def _label(self, parent, text, color, size, bold=False, pady=(0, 0)):
+        label = tk.Label(parent, text=text, bg=parent.cget("bg"), fg=color,
+                         anchor="w", justify="left",
+                         font=("Segoe UI", -size, "bold" if bold else "normal"))
+        label.pack(fill="x", pady=pady)
+
+    def _right_click(self, event):
+        x, y = event.x_root, event.y_root
+        self.close()
+        self.root.after_idle(lambda: self.on_context(x, y))
+
+    def _focus_out(self, _event):
+        window = self.window
+        if window is None:
+            return
+
+        def close_if_outside():
+            if self.window is not window:
+                return
+            try:
+                point = wintypes.POINT()
+                _user32.GetCursorPos(ctypes.byref(point))
+                on_trigger = self.trigger_contains(point.x, point.y)
+                held = int(_user32.GetAsyncKeyState(1)) & 0x8000
+            except Exception:
+                on_trigger, held = False, 0
+            if held:
+                window.after(25, close_if_outside)
+            elif on_trigger:
+                window.after(200, lambda: self.close()
+                             if self.window is window else None)
+            else:
+                self.close()
+
+        window.after_idle(close_if_outside)
+
+
 # ---------------- Visibility selection panel ----------------
 
 _VIS_WIDTH = 292
@@ -8050,6 +8275,14 @@ def _visibility_selftest():
     dark = _visibility_panel_image(292, 259, "dark", "hidden", False,
                                    hover=3, focus=2, focus_visible=True)
     assert dark.size == (292, 259) and dark.getbbox() == (0, 0, 292, 259)
+    rows = _taskbar_detail_rows({
+        "five_hour": {"utilization": 25},
+        "seven_day": {"utilization": 40},
+        "limits": [{"kind": "weekly_scoped", "percent": 60,
+                    "scope": {"model": {"display_name": "Fable"}}}],
+    })
+    assert tuple((label, used) for label, used, _reset in rows) == (
+        ("현재 세션", 25.0), ("주간 한도", 40.0), ("Fable 주간", 60.0))
 
 
 # ---------------- Widget ----------------
@@ -8082,6 +8315,7 @@ class Widget:
         self._login_poll_attempts = 0
         self.minimized = self.desktop_mode == "mini"
         self._mini_pcts = (0.0, 0.0, 0.0)
+        self._last_error = None
         self.taskbar = None
         self._taskbar_events = queue.Queue()
 
@@ -8142,9 +8376,11 @@ class Widget:
             self.root,
             self._visibility_select_mode,
             self._visibility_toggle_taskbar,
-            self._taskbar_contains_screen,
+            self._taskbar_icon_contains_screen,
             self._popup_menu,
         )
+        self._taskbar_details = ClaudeTaskbarDetails(
+            self.root, self._taskbar_usage_contains_screen, self._popup_menu)
         self.root.bind_all("<Button-1>", self._on_global_click, add="+")
         # Double-click the mini strip restores the full card.
         self.root.bind("<Double-Button-1>", self._on_double_click, add="+")
@@ -8556,6 +8792,8 @@ class Widget:
     def _toggle_alpha_popup(self):
         if hasattr(self, "_visibility_panel"):
             self._visibility_panel.close()
+        if hasattr(self, "_taskbar_details"):
+            self._taskbar_details.close()
         if self._alpha_popup is not None and self._alpha_popup.winfo_exists():
             self._close_alpha_popup()
             return
@@ -8739,6 +8977,8 @@ class Widget:
         while the desktop window is withdrawn."""
         if hasattr(self, "_visibility_panel"):
             self._visibility_panel.close()
+        if hasattr(self, "_taskbar_details"):
+            self._taskbar_details.close()
         self._close_alpha_popup()
         alive = self.taskbar is not None and self.taskbar.available
         self.desktop_mode_var.set(self.desktop_mode)
@@ -8990,6 +9230,7 @@ class Widget:
     def _render(self, data, err, retry_after=0):
         self.fetching = False
         if err or not data:
+            self._last_error = err or "데이터 없음"
             if err == "LOGIN_REQUIRED":
                 self._consec_429 = 0
                 self.footer_lbl.config(text="로그인 필요 · 클릭", fg=self.theme["danger"])
@@ -9009,10 +9250,15 @@ class Widget:
             self.footer_lbl.config(text=err or "데이터 없음", fg=self.theme["danger"])
             # Keep the last good numbers on the taskbar strip, amber dot.
             self._taskbar_update(message=err or "데이터 없음", stale=True)
+            if hasattr(self, "_taskbar_details"):
+                self._taskbar_details.update(
+                    getattr(self, "_last_data", None), err or "데이터 없음",
+                    self.theme_name)
             return
         # Success path — cancel any pending unlock-refresh, nothing to retry.
         self._cancel_unlock_refresh()
         self._consec_429 = 0
+        self._last_error = None
         self._last_data = data
         fh = data.get("five_hour") or {}
         sd = data.get("seven_day") or {}
@@ -9061,6 +9307,8 @@ class Widget:
         self._draw_mini()
         # taskbar strip shows only the 5h session and the weekly limit
         self._taskbar_update(s_pct, w_pct)
+        if hasattr(self, "_taskbar_details"):
+            self._taskbar_details.update(data, None, self.theme_name)
 
     def _schedule_refresh(self):
         # Always schedule at the configured interval — no backoff, no
@@ -9205,7 +9453,8 @@ class Widget:
             return
         try:
             surface = TaskbarSurface(
-                lambda x, y: self._taskbar_events.put(("left", x, y)),
+                lambda x, y: self._taskbar_events.put(("details", x, y)),
+                lambda x, y: self._taskbar_events.put(("visibility", x, y)),
                 lambda x, y: self._taskbar_events.put(("right", x, y)),
                 lambda decision: self._taskbar_events.put(("drop", decision)),
                 lambda value: self._taskbar_events.put(("priority", value)))
@@ -9235,8 +9484,10 @@ class Widget:
             except queue.Empty:
                 break
             try:
-                if event[0] == "left":
+                if event[0] == "visibility":
                     self._show_visibility_panel(event[1], event[2])
+                elif event[0] == "details":
+                    self._show_taskbar_details(event[1], event[2])
                 elif event[0] == "drop":
                     self._apply_taskbar_drop(event[1])
                 elif event[0] == "priority":
@@ -9368,11 +9619,28 @@ class Widget:
     def _taskbar_contains_screen(self, x, y):
         return bool(self.taskbar is not None and self.taskbar.contains_screen(x, y))
 
+    def _taskbar_icon_contains_screen(self, x, y):
+        return bool(self.taskbar is not None and
+                    self.taskbar.region_contains_screen("icon", x, y))
+
+    def _taskbar_usage_contains_screen(self, x, y):
+        return bool(self.taskbar is not None and
+                    self.taskbar.region_contains_screen("usage", x, y))
+
     def _show_visibility_panel(self, x, y):
         """Toggle the taskbar's compact surface selector."""
         self._close_alpha_popup()
+        self._taskbar_details.close()
         avoid = self.taskbar.screen_rect() if self.taskbar is not None else None
         self._visibility_panel.toggle(x, y, self.cfg, self.theme_name, avoid)
+
+    def _show_taskbar_details(self, x, y):
+        """Toggle current usage details from the strip's usage block."""
+        self._close_alpha_popup()
+        self._visibility_panel.close()
+        self._taskbar_details.toggle(
+            x, y, getattr(self, "_last_data", None), self._last_error,
+            self.theme_name)
 
     def _visibility_select_mode(self, mode):
         self._set_desktop_mode(mode)
@@ -9403,6 +9671,8 @@ class Widget:
         save_config(self.cfg)
         if hasattr(self, "_visibility_panel"):
             self._visibility_panel.close()
+        if hasattr(self, "_taskbar_details"):
+            self._taskbar_details.close()
         if getattr(self, "taskbar", None):
             try:
                 self.taskbar.stop()
