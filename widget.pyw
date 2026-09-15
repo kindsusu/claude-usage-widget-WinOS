@@ -80,6 +80,11 @@ DEFAULT_CONFIG = {
     "mini_scale": 1.0,  # independent mini-mode size, adjustable live
     "auto_update": True,  # pull new releases from GitHub and self-restart
     "taskbar_visible": True,  # embedded 2-row strip inside the real taskbar
+    # SHARED STRIP CONTRACT -- identical keys, values and defaults in the Codex
+    # widget (config.py: TaskbarZone / TaskbarHost / taskbar_host_monitor).
+    "taskbar_zone": "left",        # "left" | "right" end of the host taskbar
+    "taskbar_host": "primary",     # "primary" | "secondary" taskbar window
+    "taskbar_host_monitor": "",    # szDevice of the secondary host's monitor
 }
 
 # Keys that never persist to widget_config.json — changes via the prompt
@@ -5240,6 +5245,12 @@ _TB_HCF_HIGHCONTRASTON = 0x1
 _TB_AC_SRC_ALPHA = 0x1
 _TB_DIB_RGB_COLORS = 0
 _TB_WM_MOUSEMOVE = 0x0200
+_TB_WM_LBUTTONDOWN = 0x0201
+_TB_WM_CAPTURECHANGED = 0x0215
+_TB_SM_CXDRAG = 68
+_TB_SM_CYDRAG = 69
+_TB_VK_ESCAPE = 0x1B
+_TB_SWP_NOZORDER = 0x0004
 _TB_WM_MOUSELEAVE = 0x02A3
 _TB_TME_LEAVE = 0x2
 # Same translucent wash the Codex strip uses for its hover state.
@@ -5268,6 +5279,22 @@ _TB_GAP = 4
 # exposed as a button still cannot be covered.
 _TB_EDGE_MARGIN = 8
 _TB_LEADING_BAND = 200
+# Strip destination vocabulary, mirrored from the Codex widget's enums.
+_TB_ZONE_LEFT = "left"
+_TB_ZONE_RIGHT = "right"
+_TB_ZONES = (_TB_ZONE_LEFT, _TB_ZONE_RIGHT)
+_TB_HOST_PRIMARY = "primary"
+_TB_HOST_SECONDARY = "secondary"
+_TB_HOSTS = (_TB_HOST_PRIMARY, _TB_HOST_SECONDARY)
+_TB_MAX_DEVICE_NAME = 64
+_TB_SECONDARY_CLASS = "Shell_SecondaryTrayWnd"
+# (label, zone, host) — label strings are identical to the Codex widget's.
+_TB_PLACEMENT_ROWS = (
+    ("주 모니터 · 왼쪽", _TB_ZONE_LEFT, _TB_HOST_PRIMARY),
+    ("주 모니터 · 오른쪽", _TB_ZONE_RIGHT, _TB_HOST_PRIMARY),
+    ("보조 모니터 · 왼쪽", _TB_ZONE_LEFT, _TB_HOST_SECONDARY),
+    ("보조 모니터 · 오른쪽", _TB_ZONE_RIGHT, _TB_HOST_SECONDARY),
+)
 # Usage block columns: label | bar | right-aligned %. The bar ran 45..104
 # (59px) until 2026-09-14, when the user asked for 80% of that length; it is
 # now 47px and the severity COLOUR carries the reading.
@@ -5314,6 +5341,12 @@ class _TB_WNDCLASSW(ctypes.Structure):
 class _TB_HIGHCONTRASTW(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.UINT), ("dwFlags", wintypes.DWORD),
                 ("lpszDefaultScheme", wintypes.LPWSTR)]
+
+
+class _TB_MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", _TB_RECT),
+                ("rcWork", _TB_RECT), ("dwFlags", wintypes.DWORD),
+                ("szDevice", wintypes.WCHAR * 32)]
 
 
 class _TB_TRACKMOUSEEVENT(ctypes.Structure):
@@ -5407,6 +5440,24 @@ def _tb_u32():
         lib.GetCursorPos.restype = wintypes.BOOL
         lib.TrackMouseEvent.argtypes = [ctypes.POINTER(_TB_TRACKMOUSEEVENT)]
         lib.TrackMouseEvent.restype = wintypes.BOOL
+        lib.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND,
+                                       wintypes.LPCWSTR, wintypes.LPCWSTR]
+        lib.FindWindowExW.restype = wintypes.HWND
+        lib.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        lib.MonitorFromWindow.restype = ctypes.c_void_p
+        lib.GetMonitorInfoW.argtypes = [ctypes.c_void_p,
+                                         ctypes.POINTER(_TB_MONITORINFOEXW)]
+        lib.GetMonitorInfoW.restype = wintypes.BOOL
+        lib.WindowFromPoint.argtypes = [wintypes.POINT]
+        lib.WindowFromPoint.restype = wintypes.HWND
+        lib.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        lib.GetAncestor.restype = wintypes.HWND
+        lib.SetCapture.argtypes = [wintypes.HWND]
+        lib.SetCapture.restype = wintypes.HWND
+        lib.ReleaseCapture.argtypes = []
+        lib.ReleaseCapture.restype = wintypes.BOOL
+        lib.GetSystemMetrics.argtypes = [ctypes.c_int]
+        lib.GetSystemMetrics.restype = ctypes.c_int
         lib.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         lib.GetClassNameW.restype = ctypes.c_int
         lib.EnumChildWindows.argtypes = [wintypes.HWND, ctypes.c_void_p,
@@ -5467,16 +5518,37 @@ def _tb_lp(value, dpi):
     return max(1, (value * max(96, dpi) + 48) // 96)
 
 
-def _tb_place(taskbar, notify, occupied, regions, dpi, siblings=()):
-    """Pick unused taskbar space.
+def _tb_free_runs(taskbar, notify, regions, gap, margin):
+    """(start, end) of every free horizontal run between the two edges.
 
-    With a sibling usage strip on the bar (the Codex widget lives on the left)
-    we sweep the free runs left to right and take the first one that fits, so
-    this strip lands beside its sibling instead of across the bar. `regions`
-    carries the taskbar buttons AND the sibling rects, so no run overlaps
-    anything. Without a sibling we keep the original run before the tray
-    icons — grabbing the single left gap first would evict the Codex strip,
-    which needs its full width and cannot fall back to the tray run.
+    SHARED STRIP CONTRACT — mirrors codex free_runs(). Both ends are measured,
+    never assumed: a secondary taskbar carries no tray at all, so the trailing
+    run simply ends at the taskbar's own edge margin."""
+    runs = []
+    cursor = taskbar[0] + margin
+    for region in (*regions, notify):
+        edge = min(taskbar[2] - margin, region[0] - gap)
+        if edge > cursor:
+            runs.append((cursor, edge))
+        cursor = max(cursor, region[2] + gap)
+    limit = taskbar[2] - margin
+    if limit > cursor:
+        runs.append((cursor, limit))
+    return tuple(runs)
+
+
+def _tb_place(taskbar, notify, occupied, regions, dpi, siblings=(),
+              zone=_TB_ZONE_LEFT, claim_edge=False):
+    """Pick unused taskbar space at the requested end of the bar.
+
+    SHARED STRIP CONTRACT — mirrors codex place_taskbar_widget(). Runs are
+    swept in the zone's own direction and the first one that fits wins, so a
+    left strip with no room on the left still lands before the tray and a
+    right strip with no room there falls back toward the leading edge. A run
+    that begins at the edge margin or at a sibling strip is taken flush with
+    that anchor, which is what puts the two strips side by side.
+    `claim_edge` drops the sibling strips from the obstacle set so the sweep
+    can take the slot they hold; they step aside on their own next scan.
     """
     tl, tt, tr, tb = taskbar
     tw, th = tr - tl, tb - tt
@@ -5486,47 +5558,171 @@ def _tb_place(taskbar, notify, occupied, regions, dpi, siblings=()):
     if height < _tb_lp(32, dpi):
         return None
     gap = _tb_lp(4, dpi)
-    pref = _tb_lp(_TB_PREF_W, dpi)
-    floor = _tb_lp(_TB_MIN_W, dpi)
-    left = width = None
-    if siblings:
-        # Start at the very edge: whatever really sits there (a Widgets
-        # surface, a left-aligned Start cluster) arrives in `regions`.
-        gap_left = tl + _tb_lp(_TB_EDGE_MARGIN, dpi)
-        beside = {r[2] + gap for r in siblings}
-        ordered = sorted((r for r in regions if r[2] > r[0] and r[3] > r[1]),
-                         key=lambda r: r[0])
-        for region in (*ordered, notify):
-            gap_right = min(tr, region[0] - gap)
-            if gap_right - gap_left >= floor:
-                width = min(pref, gap_right - gap_left)
-                # A run that starts at the sibling strip is the one the user
-                # asked for: sit right against it. Any other run keeps the
-                # original behaviour of hugging the obstacle on its right.
-                left = gap_left if gap_left in beside else gap_right - width
-                break
-            gap_left = max(gap_left, region[2] + gap)
-    if left is None:
-        # No free run on the left: squeeze into the one before the tray icons.
-        right = min(tr, notify[0] - gap)
-        left_edge = tl if occupied is None else max(tl, occupied[2]) + gap
-        available = right - left_edge
-        if available < floor:
-            return None                  # no room: caller silently gives up
-        width = min(pref, available)
-        left = right - width
+    pref = max(_tb_lp(_TB_PREF_W, dpi), _tb_lp(_TB_MIN_W, dpi))
+    margin = _tb_lp(_TB_EDGE_MARGIN, dpi)
+    kept = () if claim_edge else tuple(siblings)
+    source = tuple(regions)
+    if siblings and claim_edge:
+        dropped = {(r[0], r[2]) for r in siblings}
+        source = tuple(r for r in source if (r[0], r[2]) not in dropped)
+    ordered = sorted((r for r in source if r[2] > r[0] and r[3] > r[1]),
+                     key=lambda r: r[0])
+    runs = [run for run in _tb_free_runs(taskbar, notify, ordered, gap, margin)
+            if run[1] - run[0] >= pref]
+    if not runs:
+        return None                      # no room: caller silently gives up
+    left_anchors = {tl + margin} | {r[2] + gap for r in kept}
+    right_anchors = ({min(tr - margin, notify[0] - gap)}
+                     | {r[0] - gap for r in kept})
+    if zone == _TB_ZONE_LEFT:
+        start, end = runs[0]
+        left = start if start in left_anchors else end - pref
+    else:
+        start, end = runs[-1]
+        left = end - pref if end in right_anchors else start
     top = tt + max(0, (th - height) // 2)
-    return (left, top, left + width, top + height)
+    return (left, top, left + pref, top + height)
+
+
+def _tb_choose_host(candidates, host, monitor):
+    """(candidate, fallback) for the configured host among the live taskbars.
+
+    SHARED STRIP CONTRACT — mirrors codex choose_host(). A candidate is
+    (hwnd, bounds, device_name, primary). An unplugged secondary monitor falls
+    back to the primary taskbar WITHOUT touching the saved setting, so the
+    strip returns to the chosen screen by itself once the monitor is back."""
+    primary = next((item for item in candidates if item[3]), None)
+    if host != _TB_HOST_SECONDARY:
+        return (primary, primary is None)
+    wanted = monitor.casefold()
+    secondary = next(
+        (item for item in candidates
+         if not item[3] and (not wanted or item[2].casefold() == wanted)),
+        None)
+    if secondary is not None:
+        return (secondary, False)
+    return (primary, True)
+
+
+def _tb_decide_drop(point, candidates, siblings=()):
+    """(candidate, zone, claim_edge) for a released drag, or None.
+
+    SHARED STRIP CONTRACT — mirrors codex decide_drop(). None means the strip
+    was dropped outside every taskbar, which the caller reads as "keep the
+    previous placement"."""
+    x, y = point
+    host = next(
+        (item for item in candidates
+         if item[1][0] <= x < item[1][2] and item[1][1] <= y < item[1][3]),
+        None)
+    if host is None:
+        return None
+    bounds = host[1]
+    middle = (bounds[0] + bounds[2]) // 2
+    zone = _TB_ZONE_LEFT if x < middle else _TB_ZONE_RIGHT
+    inside = tuple(r for r in siblings
+                   if r[0] < bounds[2] and r[2] > bounds[0])
+    # Dropped on the sibling's edge-facing half (or past it): the user aimed
+    # at that slot, so take it. Its inner half means "sit beside it".
+    if zone == _TB_ZONE_LEFT:
+        same = tuple(r for r in inside if (r[0] + r[2]) // 2 < middle)
+        claim = bool(same) and x < min((r[0] + r[2]) // 2 for r in same)
+    else:
+        same = tuple(r for r in inside if (r[0] + r[2]) // 2 >= middle)
+        claim = bool(same) and x > max((r[0] + r[2]) // 2 for r in same)
+    return (host, zone, claim)
+
+
+def _tb_clamp_to_host(rect, host):
+    """Keep a dragged strip inside its taskbar, width unchanged."""
+    width = rect[2] - rect[0]
+    left = max(host[0], min(rect[0], host[2] - width))
+    return (left, rect[1], left + width, rect[3])
+
+
+def _tb_zone_selftest():
+    """Zone, host and drop rules — the Codex test_taskbar_zones.py cases.
+
+    SHARED STRIP CONTRACT: every expectation here is the value the Codex
+    implementation returns for the same input."""
+    bar, notify = (0, 1000, 1920, 1048), (1740, 1000, 1920, 1048)
+    buttons = (500, 1000, 1450, 1048)
+    # Mirror: left takes the edge margin, right hugs the tray.
+    left = _tb_place(bar, notify, buttons, (buttons,), 96, (),
+                     _TB_ZONE_LEFT)
+    right = _tb_place(bar, notify, buttons, (buttons,), 96, (),
+                      _TB_ZONE_RIGHT)
+    assert left == (8, 1001, 169, 1047), left
+    assert right == (1575, 1001, 1736, 1047), right
+    # Right zone sits flush LEFT of a sibling in the same zone.
+    sib_r = (1575, 1000, 1736, 1048)
+    flush = _tb_place(bar, notify, (500, 1000, 1736, 1048),
+                      ((500, 1000, 1300, 1048), sib_r), 96, (sib_r,),
+                      _TB_ZONE_RIGHT)
+    assert flush == (1410, 1001, 1571, 1047), flush
+    # A full zone falls back to the other end.
+    full_left = (8, 1000, 1450, 1048)
+    fallback = _tb_place(bar, notify, full_left, (full_left,), 96, (),
+                         _TB_ZONE_LEFT)
+    assert fallback is not None and fallback[2] <= 1736, fallback
+    # A secondary bar has no tray: its own right edge bounds the sweep.
+    sbar = (1920, 1000, 3840, 1048)
+    snotify = (sbar[2], sbar[1], sbar[2], sbar[3])
+    sregion = (2400, 1000, 2600, 1048)
+    assert _tb_place(sbar, snotify, None, (sregion,), 96, (),
+                     _TB_ZONE_LEFT) == (1928, 1001, 2089, 1047)
+    assert _tb_place(sbar, snotify, None, (sregion,), 96, (),
+                     _TB_ZONE_RIGHT) == (3671, 1001, 3832, 1047)
+    # Claiming the edge ignores the sibling only, never a real button.
+    sib_l, wide = (8, 1000, 169, 1048), (900, 1000, 1450, 1048)
+    polite = _tb_place(bar, notify, (8, 1000, 1450, 1048),
+                       (sib_l, wide), 96, (sib_l,), _TB_ZONE_LEFT)
+    claimed = _tb_place(bar, notify, (8, 1000, 1450, 1048),
+                        (sib_l, wide), 96, (sib_l,), _TB_ZONE_LEFT, True)
+    assert polite == (173, 1001, 334, 1047), polite
+    assert claimed == (8, 1001, 169, 1047), claimed
+    assert claimed[2] <= wide[0], claimed
+    # Host selection: named secondary, missing monitor, unnamed secondary.
+    primary = (1, (0, 1000, 1920, 1048), "", True)
+    second = (2, (1920, 1000, 3840, 1048), "\\\\.\\DISPLAY2", False)
+    assert _tb_choose_host((primary, second), _TB_HOST_SECONDARY,
+                           "\\\\.\\DISPLAY2") == (second, False)
+    assert _tb_choose_host((primary,), _TB_HOST_SECONDARY,
+                           "\\\\.\\DISPLAY2") == (primary, True)
+    assert _tb_choose_host((primary, second), _TB_HOST_SECONDARY,
+                           "") == (second, False)
+    assert _tb_choose_host((primary, second), _TB_HOST_PRIMARY,
+                           "") == (primary, False)
+    # Drop decisions: host, zone, and the sibling-slot claim.
+    hosts = (primary, second)
+    assert _tb_decide_drop((300, 1020), hosts) == (primary, _TB_ZONE_LEFT,
+                                                    False)
+    assert _tb_decide_drop((1700, 1020), hosts) == (primary, _TB_ZONE_RIGHT,
+                                                     False)
+    assert _tb_decide_drop((2000, 1020), hosts) == (second, _TB_ZONE_LEFT,
+                                                     False)
+    assert _tb_decide_drop((500, 400), hosts) is None
+    assert _tb_decide_drop((300, 1020), (primary,), (sib_l,))[2] is False
+    assert _tb_decide_drop((20, 1020), (primary,), (sib_l,))[2] is True
+    assert _tb_decide_drop((1500, 1020), (primary,), (sib_r,))[2] is False
+    assert _tb_decide_drop((1800, 1020), (primary,), (sib_r,))[2] is True
+    # A sibling on the other taskbar never blocks this one's edge.
+    far = (1928, 1000, 2089, 1048)
+    assert _tb_decide_drop((20, 1020), hosts, (far,))[2] is False
+    # Dragging stays inside the host taskbar.
+    assert _tb_clamp_to_host((-50, 1001, 111, 1047), bar)[0] == 0
+    assert _tb_clamp_to_host((1900, 1001, 2061, 1047), bar)[2] == 1920
 
 
 def _tb_selftest():
     """Assert the placement preference order. Run by --selftest."""
+    _tb_zone_selftest()
     bar, notify = (0, 1032, 1920, 1080), (1634, 1032, 1920, 1080)
     buttons = (474, 1032, 1447, 1080)
     sibling = (251, 1033, 448, 1079)     # the Codex strip, on the left
-    # Alone: the run before the tray icons, left to the sibling widget.
+    # Alone: the leftmost free run, exactly like the Codex strip.
     alone = _tb_place(bar, notify, buttons, (buttons,), 96)
-    assert alone is not None and alone[0] >= buttons[2], alone
+    assert alone is not None and alone[0] == 8, alone
     # Beside a sibling that starts at the edge margin: flush against it.
     wide_bar, wide_notify = (0, 1032, 2560, 1080), (2100, 1032, 2560, 1080)
     wide_buttons = (900, 1032, 2000, 1080)
@@ -5678,33 +5874,97 @@ def _tb_union(rects):
             max(r[2] for r in rects), max(r[3] for r in rects))
 
 
-def _tb_find_target(own_hwnd):
-    """(taskbar_hwnd, taskbar_rect, placement_rect, dpi) or None."""
+def _tb_monitor_device(hwnd):
+    """Device name of the monitor a window sits on, or "" when unknown."""
     u = _tb_u32()
-    taskbar = int(u.FindWindowW("Shell_TrayWnd", None) or 0)
-    if not taskbar:
+    monitor = u.MonitorFromWindow(ctypes.c_void_p(hwnd), 0)  # DEFAULTTONULL
+    if not monitor:
+        return ""
+    info = _TB_MONITORINFOEXW()
+    info.cbSize = ctypes.sizeof(_TB_MONITORINFOEXW)
+    if not u.GetMonitorInfoW(ctypes.c_void_p(monitor), ctypes.byref(info)):
+        return ""
+    return str(info.szDevice)
+
+
+def _tb_hosts():
+    """Every taskbar we could embed into: (hwnd, rect, device, primary)."""
+    u = _tb_u32()
+    found = []
+    primary = int(u.FindWindowW("Shell_TrayWnd", None) or 0)
+    if primary:
+        bounds = _tb_window_rect(primary)
+        if bounds is not None:
+            found.append((primary, bounds, _tb_monitor_device(primary), True))
+    handle = wintypes.HWND(0)
+    while True:
+        handle = u.FindWindowExW(None, handle, _TB_SECONDARY_CLASS, None)
+        if not handle:
+            break
+        secondary = int(handle)
+        bounds = _tb_window_rect(secondary)
+        if bounds is not None and bounds[2] > bounds[0]:
+            found.append(
+                (secondary, bounds, _tb_monitor_device(secondary), False))
+    return tuple(found)
+
+
+def _tb_host_under_point(x, y):
+    """Handle of the taskbar window under a screen point, or zero."""
+    u = _tb_u32()
+    window = u.WindowFromPoint(wintypes.POINT(x, y))
+    if not window:
+        return 0
+    root = u.GetAncestor(window, 2) or window     # GA_ROOT
+    name = ctypes.create_unicode_buffer(128)
+    u.GetClassNameW(root, name, len(name))
+    if name.value in ("Shell_TrayWnd", _TB_SECONDARY_CLASS):
+        return int(root)
+    return 0
+
+
+def _tb_find_target(own_hwnd, zone=_TB_ZONE_LEFT, host=_TB_HOST_PRIMARY,
+                    monitor="", claim_edge=False):
+    """(taskbar_hwnd, taskbar_rect, placement_rect, dpi, fallback, claiming).
+
+    Re-resolves the host on every scan, so an Explorer restart or a monitor
+    coming back re-embeds into the taskbar the user actually chose."""
+    u = _tb_u32()
+    candidate, fallback = _tb_choose_host(_tb_hosts(), host, monitor)
+    if candidate is None:
         return None
-    bounds = _tb_window_rect(taskbar)
-    if bounds is None:
-        return None
+    taskbar, bounds = candidate[0], candidate[1]
+    # Secondary taskbars carry no tray at all: treat the right edge as the
+    # notification boundary so the sweep still has both ends measured.
     notify = _tb_child_rect(taskbar, {"TrayNotifyWnd", "ClockButton"})
     if notify is None:
-        return None
+        notify = (bounds[2], bounds[1], bounds[2], bounds[3])
     buttons = _tb_uia_regions(taskbar, bounds)
     # No task-list button means UIA gave us nothing usable (Explorer mid
     # restart, comtypes broken); placing blind would land on top of something.
-    if not any(name == "Taskbar.TaskListButtonAutomationPeer"
-               for name, _ in buttons):
+    # A secondary taskbar may legitimately be empty, so only demand it where
+    # it means something.
+    if candidate[3] and not any(
+            name == "Taskbar.TaskListButtonAutomationPeer"
+            for name, _ in buttons):
         return None
     siblings = _tb_sibling_rects(taskbar, own_hwnd)
     regions = tuple(rect for _, rect in buttons) + siblings
     before = tuple(r for r in regions if r[0] < notify[0])
     dpi = max(96, int(u.GetDpiForWindow(taskbar) or 96))
-    placement = _tb_place(bounds, notify, _tb_union(before), regions, dpi,
-                          siblings)
+    occupied = _tb_union(before)
+    placement = _tb_place(bounds, notify, occupied, regions, dpi, siblings,
+                          zone, claim_edge)
+    claiming = False
+    if claim_edge and placement is not None:
+        # Keep claiming until the sibling has actually moved: once both
+        # placements agree, the slot is ours without ignoring anyone.
+        settled = _tb_place(bounds, notify, occupied, regions, dpi, siblings,
+                            zone)
+        claiming = settled != placement
     if placement is None:
         return None
-    return (taskbar, bounds, placement, dpi)
+    return (taskbar, bounds, placement, dpi, fallback, claiming)
 
 
 # ----- rendering -----
@@ -6005,9 +6265,10 @@ class TaskbarSurface:
     observed on a second thread because probing UIA from the thread that owns
     the window would deadlock against the provider."""
 
-    def __init__(self, on_left, on_right):
+    def __init__(self, on_left, on_right, on_move=None):
         self._on_left = on_left
         self._on_right = on_right
+        self._on_move = on_move or (lambda *_args: None)
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._stop = threading.Event()
@@ -6023,11 +6284,40 @@ class TaskbarSurface:
         self._hwnd = 0
         self._wndproc = None
         self._target = None
+        # Where the strip wants to live (SHARED STRIP CONTRACT).
+        self._zone = _TB_ZONE_LEFT
+        self._host = _TB_HOST_PRIMARY
+        self._monitor = ""
+        self._claim_edge = False
+        # Drag state: press point, window rect at press time, threshold passed.
+        self._press = None
+        self._press_rect = None
+        self._dragging = False
 
     @property
     def available(self):
         with self._lock:
             return self._available
+
+    @property
+    def host_fallback(self):
+        """True while the strip borrows the primary taskbar (host missing)."""
+        with self._lock:
+            target = self._target
+        return bool(target is not None and len(target) > 4 and target[4])
+
+    def set_placement(self, zone, host, monitor, claim_edge=False):
+        """Publish new saved placement settings to the native worker."""
+        with self._lock:
+            state = (zone, host, monitor, claim_edge)
+            if state == (self._zone, self._host, self._monitor,
+                         self._claim_edge):
+                return
+            (self._zone, self._host, self._monitor,
+             self._claim_edge) = state
+            hwnd = self._hwnd
+        if hwnd:
+            _tb_u32().PostMessageW(hwnd, _TB_WM_APP_LAYOUT, 0, 0)
 
     @property
     def attached(self):
@@ -6162,7 +6452,15 @@ class TaskbarSurface:
             return 0
         if message == _TB_WM_ERASEBKGND:
             return 1
+        if message == _TB_WM_LBUTTONDOWN:
+            self._begin_press(hwnd)
+            return 0
+        if message == _TB_WM_CAPTURECHANGED:
+            self._cancel_drag(hwnd)        # capture lost: treat as cancelled
+            return 0
         if message == _TB_WM_MOUSEMOVE:
+            if self._handle_drag_move(hwnd):
+                return 0
             if not self._hover:
                 self._hover = True
                 self._paint(hwnd)
@@ -6179,6 +6477,8 @@ class TaskbarSurface:
                 self._paint(hwnd)
             return 0
         if message in (_TB_WM_LBUTTONUP, _TB_WM_RBUTTONUP):
+            if message == _TB_WM_LBUTTONUP and self._finish_drag(hwnd):
+                return 0                   # it was a drag, not a click
             point = wintypes.POINT()
             u.GetCursorPos(ctypes.byref(point))
             callback = (self._on_left if message == _TB_WM_LBUTTONUP
@@ -6205,6 +6505,91 @@ class TaskbarSurface:
             u.PostQuitMessage(0)
             return 0
         return u.DefWindowProcW(hwnd, message, wparam, lparam)
+
+    # ----- private: drag (SHARED STRIP CONTRACT) -----
+
+    def _begin_press(self, hwnd):
+        """Remember where a left press started; the move decides the rest."""
+        u = _tb_u32()
+        point = wintypes.POINT()
+        if not u.GetCursorPos(ctypes.byref(point)):
+            return
+        rect = _tb_window_rect(hwnd)
+        with self._lock:
+            self._press = (point.x, point.y)
+            self._press_rect = rect
+            self._dragging = False
+        u.SetCapture(hwnd)
+
+    def _handle_drag_move(self, hwnd):
+        """Move the strip with the pointer. True once a drag is under way."""
+        u = _tb_u32()
+        with self._lock:
+            press, rect, dragging = self._press, self._press_rect, self._dragging
+        if press is None or rect is None:
+            return False
+        if u.GetAsyncKeyState(_TB_VK_ESCAPE) & 0x8000:
+            self._cancel_drag(hwnd)
+            return True
+        point = wintypes.POINT()
+        if not u.GetCursorPos(ctypes.byref(point)):
+            return dragging
+        if not dragging:
+            if (abs(point.x - press[0]) < u.GetSystemMetrics(_TB_SM_CXDRAG)
+                    and abs(point.y - press[1])
+                    < u.GetSystemMetrics(_TB_SM_CYDRAG)):
+                return False               # still a click, not a drag
+            with self._lock:
+                self._dragging = True
+        host = _tb_window_rect(int(u.GetParent(hwnd) or 0))
+        shift = point.x - press[0]
+        moved = (rect[0] + shift, rect[1], rect[2] + shift, rect[3])
+        if host is not None:
+            moved = _tb_clamp_to_host(moved, host)
+        u.SetWindowPos(hwnd, None, moved[0], moved[1],
+                       moved[2] - moved[0], moved[3] - moved[1],
+                       _TB_SWP_NOACTIVATE | _TB_SWP_NOZORDER)
+        return True
+
+    def _finish_drag(self, hwnd):
+        """Release a drag and report the drop. True when a drag was handled."""
+        with self._lock:
+            pressed = self._press is not None
+            dragging = self._dragging
+            self._press = self._press_rect = None
+            self._dragging = False
+        if not pressed and not dragging:
+            return False                   # a synthetic release: nothing held
+        u = _tb_u32()
+        u.ReleaseCapture()
+        if not dragging:
+            return False
+        point = wintypes.POINT()
+        if u.GetCursorPos(ctypes.byref(point)):
+            decision = _tb_decide_drop(
+                (point.x, point.y), _tb_hosts(),
+                _tb_sibling_rects(int(u.GetParent(hwnd) or 0), hwnd))
+            if decision is not None:
+                try:
+                    self._on_move(decision)
+                except Exception:
+                    pass
+        # Either way, snap back to a computed placement instead of the
+        # free-hand position the pointer left behind.
+        u.PostMessageW(hwnd, _TB_WM_APP_LAYOUT, 0, 0)
+        return True
+
+    def _cancel_drag(self, hwnd):
+        """Abandon a drag (Esc, lost capture) and restore the placement."""
+        with self._lock:
+            dragging = self._dragging
+            self._press = self._press_rect = None
+            self._dragging = False
+        if not dragging:
+            return
+        u = _tb_u32()
+        u.ReleaseCapture()
+        u.PostMessageW(hwnd, _TB_WM_APP_LAYOUT, 0, 0)
 
     def _set_accessible_name(self, hwnd):
         with self._lock:
@@ -6238,8 +6623,11 @@ class TaskbarSurface:
     def _observe(self, hwnd, stop):
         _tb_u32().SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
         while not stop.is_set():
+            with self._lock:
+                zone, host = self._zone, self._host
+                monitor, claim = self._monitor, self._claim_edge
             try:
-                target = _tb_find_target(hwnd)
+                target = _tb_find_target(hwnd, zone, host, monitor, claim)
             except Exception:
                 target = None
             if stop.is_set():
@@ -6248,6 +6636,9 @@ class TaskbarSurface:
                 if stop.is_set() or hwnd != self._hwnd:
                     return
                 self._target = target
+                if claim and target is not None and not target[5]:
+                    # The sibling stepped aside: stop ignoring it.
+                    self._claim_edge = False
             if not _tb_u32().PostMessageW(hwnd, _TB_WM_APP_LAYOUT, 0, 0):
                 return
             if stop.wait(_TB_POLL_MS / 1000.0):
@@ -6263,7 +6654,7 @@ class TaskbarSurface:
             if hwnd:
                 u.ShowWindow(hwnd, _TB_SW_HIDE)
             return
-        parent, bounds, placement, _ = target
+        parent, bounds, placement = target[0], target[1], target[2]
         attached = int(u.GetParent(hwnd) or 0) == parent
         if attached:
             try:
@@ -6314,6 +6705,15 @@ def load_config():
     cfg["desktop_mode"] = mode
     cfg["desktop_restore_mode"] = restore
     cfg["minimized"] = mode == "mini"
+    # Strip destination: unknown values fall back to the defaults rather than
+    # reaching the placement logic (SHARED STRIP CONTRACT).
+    if cfg.get("taskbar_zone") not in _TB_ZONES:
+        cfg["taskbar_zone"] = DEFAULT_CONFIG["taskbar_zone"]
+    if cfg.get("taskbar_host") not in _TB_HOSTS:
+        cfg["taskbar_host"] = DEFAULT_CONFIG["taskbar_host"]
+    monitor = cfg.get("taskbar_host_monitor")
+    if not isinstance(monitor, str) or len(monitor) > _TB_MAX_DEVICE_NAME:
+        cfg["taskbar_host_monitor"] = DEFAULT_CONFIG["taskbar_host_monitor"]
     return cfg
 
 
@@ -7444,8 +7844,6 @@ class Widget:
             self.outer.pack()
         # attribute churn above can re-add the taskbar button
         hide_from_taskbar(self._hwnd())
-        if hasattr(self, "mini_var"):
-            self.mini_var.set(self.minimized)
 
     def _set_desktop_mode(self, mode, save=True):
         """Apply one exclusive desktop mode and keep legacy config in sync."""
@@ -7477,8 +7875,6 @@ class Widget:
         self.cfg["minimized"] = mode == "mini"
         if hasattr(self, "desktop_mode_var"):
             self.desktop_mode_var.set(mode)
-        if hasattr(self, "mini_var"):
-            self.mini_var.set(mode == "mini")
         if hasattr(self, "_visibility_panel"):
             self._visibility_panel.update(self.cfg, self.theme_name)
         if save:
@@ -7620,7 +8016,6 @@ class Widget:
         self.menu = tk.Menu(self.root, tearoff=0, font=menu_font)
         self.menu.add_command(label="지금 새로고침", command=self.refresh)
         self.menu.add_separator()
-        self.mini_var = tk.BooleanVar(value=self.minimized)
         self.desktop_mode_var = tk.StringVar(value=self.desktop_mode)
         desktop_menu = tk.Menu(self.menu, tearoff=0, font=menu_font)
         for label, value in (("일반 모드", "normal"),
@@ -7644,6 +8039,21 @@ class Widget:
                                    variable=self.taskbar_var,
                                    command=self._toggle_taskbar)
         self._taskbar_menu_index = self.menu.index("end")
+        # SHARED STRIP CONTRACT — labels copied verbatim from the Codex
+        # widget's menus.py so both strips offer the same four destinations.
+        self.placement_var = tk.StringVar(
+            value=f"{self.cfg.get('taskbar_host', 'primary')}:"
+                  f"{self.cfg.get('taskbar_zone', 'left')}")
+        placement_menu = tk.Menu(self.menu, tearoff=0, font=menu_font)
+        for label, zone, host in _TB_PLACEMENT_ROWS:
+            placement_menu.add_radiobutton(
+                label=label,
+                variable=self.placement_var,
+                value=f"{host}:{zone}",
+                command=lambda z=zone, h=host: self._set_taskbar_placement(z, h),
+            )
+        self.menu.add_cascade(label="작업표시줄 위치", menu=placement_menu)
+        self._placement_menu = placement_menu
         self.menu.add_command(label="플랜 이름 변경", command=self._prompt_plan)
         self.menu.add_command(label="새로고침 간격 변경", command=self._prompt_interval)
         self.auto_update_var = tk.BooleanVar(value=bool(self.cfg.get("auto_update", True)))
@@ -7687,6 +8097,7 @@ class Widget:
         alive = self.taskbar is not None and self.taskbar.available
         self.desktop_mode_var.set(self.desktop_mode)
         self.taskbar_var.set(bool(self.cfg.get("taskbar_visible", True)))
+        self._sync_placement_menu()
         try:
             self.menu.entryconfigure(
                 self._taskbar_menu_index,
@@ -8149,7 +8560,8 @@ class Widget:
         try:
             surface = TaskbarSurface(
                 lambda x, y: self._taskbar_events.put(("left", x, y)),
-                lambda x, y: self._taskbar_events.put(("right", x, y)))
+                lambda x, y: self._taskbar_events.put(("right", x, y)),
+                lambda decision: self._taskbar_events.put(("drop", decision)))
             if not surface.start():
                 surface.stop()
                 return
@@ -8157,6 +8569,9 @@ class Widget:
             return
         self.taskbar = surface
         surface.set_visible(bool(self.cfg.get("taskbar_visible", True)))
+        surface.set_placement(self.cfg.get("taskbar_zone", "left"),
+                              self.cfg.get("taskbar_host", "primary"),
+                              self.cfg.get("taskbar_host_monitor", ""))
         self.root.after(120, self._taskbar_pump)
 
     def _taskbar_pump(self):
@@ -8166,17 +8581,35 @@ class Widget:
         only enqueues and this poll does the actual UI work."""
         while True:
             try:
-                kind, x, y = self._taskbar_events.get_nowait()
+                event = self._taskbar_events.get_nowait()
             except queue.Empty:
                 break
             try:
-                if kind == "left":
-                    self._show_visibility_panel(x, y)
+                if event[0] == "left":
+                    self._show_visibility_panel(event[1], event[2])
+                elif event[0] == "drop":
+                    self._apply_taskbar_drop(event[1])
                 else:
-                    self._popup_menu(x, y)
+                    self._popup_menu(event[1], event[2])
             except Exception:
                 pass
+        self._refresh_tray_status()
         self.root.after(120, self._taskbar_pump)
+
+    def _refresh_tray_status(self):
+        """Keep the tray tooltip in step with the host fallback state."""
+        status = self._taskbar_host_status()
+        if status == getattr(self, "_tray_status", None):
+            return
+        self._tray_status = status
+        icon = getattr(self, "tray_icon", None)
+        if icon is None:
+            return
+        title = "Claude Usage Widget"
+        try:
+            icon.title = title if status is None else f"{title} — {status}"
+        except Exception:
+            pass
 
     def _taskbar_update(self, session_pct=None, weekly_pct=None,
                         message=None, stale=False):
@@ -8193,6 +8626,61 @@ class Widget:
             self.taskbar.update(rows, message or "불러오는 중", stale)
         except Exception:
             pass
+
+    def _sync_placement_menu(self):
+        """Tick the live destination and grey out a missing secondary bar."""
+        if not hasattr(self, "_placement_menu"):
+            return
+        self.placement_var.set(f"{self.cfg.get('taskbar_host', 'primary')}:"
+                               f"{self.cfg.get('taskbar_zone', 'left')}")
+        try:
+            secondary = any(not host[3] for host in _tb_hosts())
+        except Exception:
+            secondary = False
+        for index, (_label, _zone, host) in enumerate(_TB_PLACEMENT_ROWS):
+            try:
+                self._placement_menu.entryconfigure(
+                    index,
+                    state="normal" if (secondary or host == _TB_HOST_PRIMARY)
+                    else "disabled")
+            except Exception:
+                pass
+
+    def _taskbar_host_status(self):
+        """Tray tooltip suffix while the chosen taskbar is unavailable.
+
+        SHARED STRIP CONTRACT — same wording as the Codex widget's tray."""
+        surface = self.taskbar
+        if surface is not None and surface.host_fallback:
+            return "선택한 작업표시줄 없음 · 주 작업표시줄 사용 중"
+        return None
+
+    def _set_taskbar_placement(self, zone, host, monitor=None, claim_edge=False):
+        """Persist a new strip destination and re-embed straight away.
+
+        SHARED STRIP CONTRACT — mirrors the Codex widget's
+        actions.set_taskbar_placement + runtime._set_taskbar_placement."""
+        if monitor is None:
+            monitor = (self.cfg.get("taskbar_host_monitor", "")
+                       if host == _TB_HOST_SECONDARY else "")
+        self.cfg["taskbar_zone"] = zone
+        self.cfg["taskbar_host"] = host
+        self.cfg["taskbar_host_monitor"] = (
+            monitor if host == _TB_HOST_SECONDARY else "")
+        save_config(self.cfg)
+        if hasattr(self, "placement_var"):
+            self.placement_var.set(f"{host}:{zone}")
+        if self.taskbar is not None:
+            self.taskbar.set_placement(zone, host,
+                                        self.cfg["taskbar_host_monitor"],
+                                        claim_edge)
+
+    def _apply_taskbar_drop(self, decision):
+        """Save where the user dropped the strip, then claim the slot."""
+        candidate, zone, claim = decision
+        host = _TB_HOST_PRIMARY if candidate[3] else _TB_HOST_SECONDARY
+        monitor = "" if candidate[3] else candidate[2]
+        self._set_taskbar_placement(zone, host, monitor, claim)
 
     def _toggle_taskbar(self):
         self.cfg["taskbar_visible"] = bool(self.taskbar_var.get())
