@@ -27,6 +27,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 import threading
 import tkinter as tk
 import urllib.error
@@ -85,6 +86,10 @@ DEFAULT_CONFIG = {
     "taskbar_zone": "left",        # "left" | "right" end of the host taskbar
     "taskbar_host": "primary",     # "primary" | "secondary" taskbar window
     "taskbar_host_monitor": "",    # szDevice of the secondary host's monitor
+    # SHARED STRIP CONTRACT -- the twins' ONLY asymmetric default: False here
+    # and True in the Codex widget, which keeps the approved order (Codex at
+    # the edge, Claude beside it) across reboots whichever starts first.
+    "taskbar_edge_priority": False,
 }
 
 # Keys that never persist to widget_config.json — changes via the prompt
@@ -5287,6 +5292,29 @@ _TB_HOST_PRIMARY = "primary"
 _TB_HOST_SECONDARY = "secondary"
 _TB_HOSTS = (_TB_HOST_PRIMARY, _TB_HOST_SECONDARY)
 _TB_MAX_DEVICE_NAME = 64
+# SHARED STRIP CONTRACT -- deterministic sibling order without any IPC.
+# A strip without edge priority waits this long for its sibling to appear
+# before taking the edge itself, so a solo install never sits one slot away
+# from the edge for good.
+_TB_EDGE_HOLD_SECONDS = 10.0
+# A claim the sibling refuses to honour means both strips want the same slot.
+# Nobody can see the other's settings, so the contest is resolved from three
+# facts each side knows about ITSELF: was I just dragged here, am I the static
+# tie-break winner, and how long have I been running.
+# Two scans (~3s) is enough evidence of a real contest while still
+# surviving a single bad UIA read.
+_TB_CLAIM_YIELD_SCANS = 2
+# A drag-claim outranks everything for this long -- long enough for the other
+# side to notice the contest and step aside.
+_TB_EDGE_EXPLICIT_SECONDS = 30.0
+# A contest inside this window after startup is a boot race, not a user
+# action, so the static winner keeps the slot.
+_TB_EDGE_STARTUP_GRACE = 15.0
+# The Codex widget owns the static tie-break; this one is the loser.
+_TB_EDGE_TIE_BREAK_WINNER = False
+_TB_SLOT_CLAIM = "claim"
+_TB_SLOT_RESERVE = "reserve"
+_TB_SLOT_SWEEP = "sweep"
 _TB_SECONDARY_CLASS = "Shell_SecondaryTrayWnd"
 # (label, zone, host) — label strings are identical to the Codex widget's.
 _TB_PLACEMENT_ROWS = (
@@ -5633,6 +5661,58 @@ def _tb_decide_drop(point, candidates, siblings=()):
     return (host, zone, claim)
 
 
+def _tb_edge_anchor(taskbar, notify, zone, gap, margin, width):
+    """Left coordinate of the slot flush with the zone's outer edge."""
+    if zone == _TB_ZONE_LEFT:
+        return taskbar[0] + margin
+    return min(taskbar[2] - margin, notify[0] - gap) - width
+
+
+def _tb_second_slot_left(taskbar, notify, zone, gap, margin, width):
+    """Left coordinate of the slot a sibling would leave for us."""
+    anchor = _tb_edge_anchor(taskbar, notify, zone, gap, margin, width)
+    if zone == _TB_ZONE_LEFT:
+        return anchor + width + gap
+    return anchor - width - gap
+
+
+def _tb_start_slot(priority, sibling_seen, waited, hold=_TB_EDGE_HOLD_SECONDS):
+    """'claim' | 'reserve' | 'sweep' — how to compete for the edge now.
+
+    SHARED STRIP CONTRACT — mirrors codex start_slot()."""
+    if priority:
+        return _TB_SLOT_CLAIM
+    if sibling_seen:
+        return _TB_SLOT_SWEEP        # the sweep lands beside the sibling
+    if waited < hold:
+        return _TB_SLOT_RESERVE      # keep the edge free a little longer
+    return _TB_SLOT_SWEEP
+
+
+def _tb_evicted_from_edge(was_at_edge, at_edge_now, sibling_at_edge):
+    """True when a sibling's claim has just taken our edge slot."""
+    return bool(was_at_edge and not at_edge_now and sibling_at_edge)
+
+
+def _tb_should_yield_edge(contested, explicit_recent, tie_break_winner, uptime,
+                          grace=_TB_EDGE_STARTUP_GRACE):
+    """Whether this strip must give up its edge claim.
+
+    SHARED STRIP CONTRACT — mirrors codex should_yield_edge(). Ordered so
+    exactly one side yields in every combination, with no message passing:
+    a strip the user just dragged onto the edge never yields; the tie-break
+    loser always yields a contested claim; the winner yields only when the
+    contest starts after its own startup grace, which is precisely when a
+    user drag caused it."""
+    if not contested:
+        return False
+    if explicit_recent:
+        return False
+    if not tie_break_winner:
+        return True
+    return uptime > grace
+
+
 def _tb_clamp_to_host(rect, host):
     """Keep a dragged strip inside its taskbar, width unchanged."""
     width = rect[2] - rect[0]
@@ -5709,6 +5789,26 @@ def _tb_zone_selftest():
     # A sibling on the other taskbar never blocks this one's edge.
     far = (1928, 1000, 2089, 1048)
     assert _tb_decide_drop((20, 1020), hosts, (far,))[2] is False
+    # Edge order: priority claims, no-priority waits then sweeps.
+    assert _tb_start_slot(True, False, 0.0) == _TB_SLOT_CLAIM
+    assert _tb_start_slot(True, True, 99.0) == _TB_SLOT_CLAIM
+    assert _tb_start_slot(False, False, 0.0) == _TB_SLOT_RESERVE
+    assert _tb_start_slot(False, False, 9.9) == _TB_SLOT_RESERVE
+    assert _tb_start_slot(False, False, 10.0) == _TB_SLOT_SWEEP
+    assert _tb_start_slot(False, True, 0.0) == _TB_SLOT_SWEEP
+    assert _tb_edge_anchor(bar, notify, _TB_ZONE_LEFT, 4, 8, 161) == 8
+    assert _tb_edge_anchor(bar, notify, _TB_ZONE_RIGHT, 4, 8, 161) == 1575
+    assert _tb_second_slot_left(bar, notify, _TB_ZONE_LEFT, 4, 8, 161) == 173
+    assert _tb_second_slot_left(bar, notify, _TB_ZONE_RIGHT, 4, 8, 161) == 1410
+    assert _tb_should_yield_edge(True, False, False, 99.0)
+    assert not _tb_should_yield_edge(False, False, False, 99.0)
+    assert not _tb_should_yield_edge(True, True, False, 99.0)
+    assert _tb_should_yield_edge(True, False, True, 99.0)
+    assert not _tb_should_yield_edge(True, False, True, 1.0)
+    assert _tb_evicted_from_edge(True, False, True)
+    assert not _tb_evicted_from_edge(True, False, False)
+    assert not _tb_evicted_from_edge(False, False, True)
+    assert not _tb_evicted_from_edge(True, True, False)
     # Dragging stays inside the host taskbar.
     assert _tb_clamp_to_host((-50, 1001, 111, 1047), bar)[0] == 0
     assert _tb_clamp_to_host((1900, 1001, 2061, 1047), bar)[2] == 1920
@@ -5924,7 +6024,8 @@ def _tb_host_under_point(x, y):
 
 
 def _tb_find_target(own_hwnd, zone=_TB_ZONE_LEFT, host=_TB_HOST_PRIMARY,
-                    monitor="", claim_edge=False):
+                    monitor="", claim_edge=False, priority=False,
+                    waited=_TB_EDGE_HOLD_SECONDS):
     """(taskbar_hwnd, taskbar_rect, placement_rect, dpi, fallback, claiming).
 
     Re-resolves the host on every scan, so an Explorer restart or a monitor
@@ -5953,18 +6054,35 @@ def _tb_find_target(own_hwnd, zone=_TB_ZONE_LEFT, host=_TB_HOST_PRIMARY,
     before = tuple(r for r in regions if r[0] < notify[0])
     dpi = max(96, int(u.GetDpiForWindow(taskbar) or 96))
     occupied = _tb_union(before)
+    gap = _tb_lp(4, dpi)
+    margin = _tb_lp(_TB_EDGE_MARGIN, dpi)
+    width = _tb_lp(_TB_PREF_W, dpi)
+    anchor = _tb_edge_anchor(bounds, notify, zone, gap, margin, width)
+    # SHARED STRIP CONTRACT: the edge race is decided here, where the live
+    # sibling rects already are.
+    mode = _tb_start_slot(priority, bool(siblings), waited)
+    claim = claim_edge or mode == _TB_SLOT_CLAIM
     placement = _tb_place(bounds, notify, occupied, regions, dpi, siblings,
-                          zone, claim_edge)
+                          zone, claim)
+    if placement is None:
+        return None
+    if mode == _TB_SLOT_RESERVE:
+        # Keep the edge free for a sibling that has not started yet.
+        reserved = _tb_second_slot_left(bounds, notify, zone, gap, margin,
+                                        width)
+        candidate = (reserved, placement[1], reserved + width, placement[3])
+        if not any(_tb_intersects(candidate, r) for r in regions):
+            placement = candidate
     claiming = False
-    if claim_edge and placement is not None:
+    if claim:
         # Keep claiming until the sibling has actually moved: once both
         # placements agree, the slot is ours without ignoring anyone.
         settled = _tb_place(bounds, notify, occupied, regions, dpi, siblings,
                             zone)
         claiming = settled != placement
-    if placement is None:
-        return None
-    return (taskbar, bounds, placement, dpi, fallback, claiming)
+    return (taskbar, bounds, placement, dpi, fallback, claiming,
+            placement[0] == anchor,
+            any(r[0] == anchor for r in siblings))
 
 
 # ----- rendering -----
@@ -6265,10 +6383,11 @@ class TaskbarSurface:
     observed on a second thread because probing UIA from the thread that owns
     the window would deadlock against the provider."""
 
-    def __init__(self, on_left, on_right, on_move=None):
+    def __init__(self, on_left, on_right, on_move=None, on_priority=None):
         self._on_left = on_left
         self._on_right = on_right
         self._on_move = on_move or (lambda *_args: None)
+        self._on_priority = on_priority or (lambda *_args: None)
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._stop = threading.Event()
@@ -6289,6 +6408,13 @@ class TaskbarSurface:
         self._host = _TB_HOST_PRIMARY
         self._monitor = ""
         self._claim_edge = False
+        # SHARED STRIP CONTRACT: edge-order bookkeeping.
+        self._priority = False
+        self._started_at = time.monotonic()
+        # When a user drag last put this strip on the edge by hand.
+        self._explicit_until = 0.0
+        self._was_at_edge = False
+        self._claim_scans = 0
         # Drag state: press point, window rect at press time, threshold passed.
         self._press = None
         self._press_rect = None
@@ -6306,15 +6432,20 @@ class TaskbarSurface:
             target = self._target
         return bool(target is not None and len(target) > 4 and target[4])
 
-    def set_placement(self, zone, host, monitor, claim_edge=False):
+    def set_placement(self, zone, host, monitor, claim_edge=False,
+                      priority=False):
         """Publish new saved placement settings to the native worker."""
         with self._lock:
-            state = (zone, host, monitor, claim_edge)
+            state = (zone, host, monitor, claim_edge, priority)
             if state == (self._zone, self._host, self._monitor,
-                         self._claim_edge):
+                         self._claim_edge, self._priority):
                 return
-            (self._zone, self._host, self._monitor,
-             self._claim_edge) = state
+            (self._zone, self._host, self._monitor, self._claim_edge,
+             self._priority) = state
+            if claim_edge:
+                # A hand-placed claim outranks the sibling's automatic one.
+                self._explicit_until = (time.monotonic()
+                                        + _TB_EDGE_EXPLICIT_SECONDS)
             hwnd = self._hwnd
         if hwnd:
             _tb_u32().PostMessageW(hwnd, _TB_WM_APP_LAYOUT, 0, 0)
@@ -6626,16 +6757,23 @@ class TaskbarSurface:
             with self._lock:
                 zone, host = self._zone, self._host
                 monitor, claim = self._monitor, self._claim_edge
+                priority, started = self._priority, self._started_at
+                was_at_edge, scans = self._was_at_edge, self._claim_scans
             try:
-                target = _tb_find_target(hwnd, zone, host, monitor, claim)
+                target = _tb_find_target(hwnd, zone, host, monitor, claim,
+                                         priority, time.monotonic() - started)
             except Exception:
                 target = None
             if stop.is_set():
                 return
+            if target is not None:
+                self._settle_edge_priority(target, priority, was_at_edge,
+                                           scans)
             with self._lock:
                 if stop.is_set() or hwnd != self._hwnd:
                     return
                 self._target = target
+                self._was_at_edge = target is not None and target[6]
                 if claim and target is not None and not target[5]:
                     # The sibling stepped aside: stop ignoring it.
                     self._claim_edge = False
@@ -6643,6 +6781,39 @@ class TaskbarSurface:
                 return
             if stop.wait(_TB_POLL_MS / 1000.0):
                 return
+
+    def _settle_edge_priority(self, target, priority, was_at_edge, scans):
+        """Keep the saved edge order in step with what actually happened.
+
+        SHARED STRIP CONTRACT. Two one-way rules, so they terminate: losing
+        the edge to a sibling claim writes priority False, and a claim the
+        sibling refuses is abandoned after _TB_CLAIM_YIELD_SCANS — this widget
+        is the tie-break loser, the Codex widget never yields."""
+        now = time.monotonic()
+        if _tb_evicted_from_edge(was_at_edge, target[6], target[7]):
+            self._yield_priority()
+            return
+        contested = bool(priority and target[5])
+        scans = scans + 1 if contested else 0
+        with self._lock:
+            self._claim_scans = scans
+            explicit_until, started = self._explicit_until, self._started_at
+        if scans >= _TB_CLAIM_YIELD_SCANS and _tb_should_yield_edge(
+                contested, now < explicit_until, _TB_EDGE_TIE_BREAK_WINNER,
+                now - started):
+            # The sibling is sitting on our slot and the rules say it stays.
+            self._yield_priority()
+
+    def _yield_priority(self):
+        """Drop this strip's edge claim and tell the app to persist it."""
+        with self._lock:
+            self._priority = False
+            self._claim_edge = False
+            self._claim_scans = 0
+        try:
+            self._on_priority(False)
+        except Exception:
+            pass
 
     def _apply_target(self):
         u = _tb_u32()
@@ -6714,6 +6885,8 @@ def load_config():
     monitor = cfg.get("taskbar_host_monitor")
     if not isinstance(monitor, str) or len(monitor) > _TB_MAX_DEVICE_NAME:
         cfg["taskbar_host_monitor"] = DEFAULT_CONFIG["taskbar_host_monitor"]
+    if not isinstance(cfg.get("taskbar_edge_priority"), bool):
+        cfg["taskbar_edge_priority"] = DEFAULT_CONFIG["taskbar_edge_priority"]
     return cfg
 
 
@@ -8561,7 +8734,8 @@ class Widget:
             surface = TaskbarSurface(
                 lambda x, y: self._taskbar_events.put(("left", x, y)),
                 lambda x, y: self._taskbar_events.put(("right", x, y)),
-                lambda decision: self._taskbar_events.put(("drop", decision)))
+                lambda decision: self._taskbar_events.put(("drop", decision)),
+                lambda value: self._taskbar_events.put(("priority", value)))
             if not surface.start():
                 surface.stop()
                 return
@@ -8571,7 +8745,10 @@ class Widget:
         surface.set_visible(bool(self.cfg.get("taskbar_visible", True)))
         surface.set_placement(self.cfg.get("taskbar_zone", "left"),
                               self.cfg.get("taskbar_host", "primary"),
-                              self.cfg.get("taskbar_host_monitor", ""))
+                              self.cfg.get("taskbar_host_monitor", ""),
+                              False,
+                              bool(self.cfg.get("taskbar_edge_priority",
+                                                False)))
         self.root.after(120, self._taskbar_pump)
 
     def _taskbar_pump(self):
@@ -8589,6 +8766,8 @@ class Widget:
                     self._show_visibility_panel(event[1], event[2])
                 elif event[0] == "drop":
                     self._apply_taskbar_drop(event[1])
+                elif event[0] == "priority":
+                    self._apply_edge_priority(event[1])
                 else:
                     self._popup_menu(event[1], event[2])
             except Exception:
@@ -8663,6 +8842,14 @@ class Widget:
         if monitor is None:
             monitor = (self.cfg.get("taskbar_host_monitor", "")
                        if host == _TB_HOST_SECONDARY else "")
+        if host == _TB_HOST_SECONDARY and not monitor:
+            # Menu selection: pin the device name of the secondary bar we are
+            # about to use, so a later reconnect returns to the same screen.
+            try:
+                monitor = next((item[2] for item in _tb_hosts()
+                                if not item[3] and item[2]), "")
+            except Exception:
+                monitor = ""
         self.cfg["taskbar_zone"] = zone
         self.cfg["taskbar_host"] = host
         self.cfg["taskbar_host_monitor"] = (
@@ -8671,16 +8858,29 @@ class Widget:
         if hasattr(self, "placement_var"):
             self.placement_var.set(f"{host}:{zone}")
         if self.taskbar is not None:
-            self.taskbar.set_placement(zone, host,
-                                        self.cfg["taskbar_host_monitor"],
-                                        claim_edge)
+            self.taskbar.set_placement(
+                zone, host, self.cfg["taskbar_host_monitor"], claim_edge,
+                bool(self.cfg.get("taskbar_edge_priority", False)))
 
     def _apply_taskbar_drop(self, decision):
         """Save where the user dropped the strip, then claim the slot."""
         candidate, zone, claim = decision
         host = _TB_HOST_PRIMARY if candidate[3] else _TB_HOST_SECONDARY
         monitor = "" if candidate[3] else candidate[2]
+        if claim:
+            # Taking the edge by hand is a lasting decision, not a one-off.
+            self.cfg["taskbar_edge_priority"] = True
         self._set_taskbar_placement(zone, host, monitor, claim)
+
+    def _apply_edge_priority(self, priority):
+        """Persist an edge-order change the native worker just observed.
+
+        SHARED STRIP CONTRACT — the only synchronisation between the twins:
+        the strip that lost the edge records that it is now second."""
+        if bool(self.cfg.get("taskbar_edge_priority", False)) == bool(priority):
+            return
+        self.cfg["taskbar_edge_priority"] = bool(priority)
+        save_config(self.cfg)
 
     def _toggle_taskbar(self):
         self.cfg["taskbar_visible"] = bool(self.taskbar_var.get())
