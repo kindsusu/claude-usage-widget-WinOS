@@ -17,6 +17,9 @@ Always-on-top Windows desktop widget showing real-time Claude Max plan usage. Ma
 - **System tray** — X button minimizes to tray; left-click tray to toggle, right-click for menu
 - **Independent display modes** — the right-click menu selects exactly one desktop state under “데스크톱 위젯” (normal, mini, or hidden), while “작업표시줄 표시” independently shows or hides the taskbar strip. The same menu and state are used from either surface and survive restart.
 - **Taskbar strip** — a two-row 5h / weekly readout embedded in the real Windows taskbar (mark on the left, remaining % on the right). Left-click opens a compact display panel — pick exactly one of Normal / Mini / Hidden plus an independent "작업표시줄 표시" checkbox; right-click opens the same advanced menu as the desktop widget.
+
+![taskbar strip](docs/img/taskbar-strip.png)
+
 - **Taskbar strip placement** — right-click → **작업표시줄 위치** jumps straight to one of four spots: primary/secondary monitor × left/right end (a checkmark shows the current one; the secondary rows are disabled with no secondary taskbar). You can also drag the strip: drop it on a taskbar's left half to join the left group (measured from the real leading edge) or the right half for the right group (just before the notification area); drop it past a sibling strip in the same group — such as the Codex widget's — to swap places, and that strip steps aside within a second or two. A near-zero-distance press is still a click, not a drag, and Esc cancels a drag in progress. If the saved secondary monitor is unplugged, the strip temporarily borrows the primary taskbar without changing the saved setting, and the tray status reads "선택한 작업표시줄 없음 · 주 작업표시줄 사용 중" until it reconnects. It is skipped silently on a vertical taskbar, without `comtypes`, or when the taskbar has no free space.
 - **Gradient bars** — smooth green → yellow → red as usage climbs
 - **Single file** — `widget.pyw` is fully self-contained (~280 KB with embedded pet sprites)

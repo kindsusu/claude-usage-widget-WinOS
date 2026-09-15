@@ -5252,10 +5252,28 @@ _TB_DIB_RGB_COLORS = 0
 _TB_WM_MOUSEMOVE = 0x0200
 _TB_WM_LBUTTONDOWN = 0x0201
 _TB_WM_CAPTURECHANGED = 0x0215
+_TB_WM_TIMER = 0x0113
+_TB_DRAG_TIMER_ID = 1
+_TB_DRAG_TIMER_MS = 50
 _TB_SM_CXDRAG = 68
 _TB_SM_CYDRAG = 69
 _TB_VK_ESCAPE = 0x1B
 _TB_SWP_NOZORDER = 0x0004
+_TB_SWP_NOSIZE = 0x0001
+_TB_WS_EX_TRANSPARENT = 0x00000020
+_TB_WS_EX_TOPMOST = 0x00000008
+_TB_HWND_TOPMOST = -1
+_TB_GHOST_CLASS_NAME = "ClaudeUsageTaskbarGhost"
+# SHARED STRIP CONTRACT -- standard drag-and-drop feel, same numbers as the
+# Codex widget: the strip stays put and dims while a click-through copy of its
+# own bitmap follows the cursor across every monitor. Both values are
+# UpdateLayeredWindow SourceConstantAlpha.
+_TB_GHOST_ALPHA = 153            # 60% -- the copy under the cursor
+_TB_DRAGGED_STRIP_ALPHA = 90     # 35% -- the original, left behind
+_TB_OPAQUE_ALPHA = 255
+_TB_DRAG_IDLE = "idle"
+_TB_DRAG_PRESSED = "pressed"
+_TB_DRAG_DRAGGING = "dragging"
 _TB_WM_MOUSELEAVE = 0x02A3
 _TB_TME_LEAVE = 0x2
 # Same translucent wash the Codex strip uses for its hover state.
@@ -5486,6 +5504,11 @@ def _tb_u32():
         lib.ReleaseCapture.restype = wintypes.BOOL
         lib.GetSystemMetrics.argtypes = [ctypes.c_int]
         lib.GetSystemMetrics.restype = ctypes.c_int
+        lib.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t,
+                                  wintypes.UINT, ctypes.c_void_p]
+        lib.SetTimer.restype = ctypes.c_size_t
+        lib.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+        lib.KillTimer.restype = wintypes.BOOL
         lib.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         lib.GetClassNameW.restype = ctypes.c_int
         lib.EnumChildWindows.argtypes = [wintypes.HWND, ctypes.c_void_p,
@@ -5713,6 +5736,29 @@ def _tb_should_yield_edge(contested, explicit_recent, tie_break_winner, uptime,
     return uptime > grace
 
 
+def _tb_ghost_origin(cursor, press, origin):
+    """Top-left of the ghost: the cursor minus where inside it was grabbed.
+
+    SHARED STRIP CONTRACT -- mirrors codex ghost_origin(). Deliberately
+    unclamped: the ghost may cross to any monitor, which is exactly what tells
+    the user a drop over there is possible."""
+    return (origin[0] + cursor[0] - press[0],
+            origin[1] + cursor[1] - press[1])
+
+
+def _tb_drag_state(state, event, beyond_threshold=False):
+    """Next pointer phase — one place for the click-vs-drag rule."""
+    if event in ("cancel", "release"):
+        return _TB_DRAG_IDLE
+    if event == "press":
+        return _TB_DRAG_PRESSED
+    if event == "move":
+        if state == _TB_DRAG_PRESSED and beyond_threshold:
+            return _TB_DRAG_DRAGGING
+        return state
+    return state
+
+
 def _tb_clamp_to_host(rect, host):
     """Keep a dragged strip inside its taskbar, width unchanged."""
     width = rect[2] - rect[0]
@@ -5809,6 +5855,21 @@ def _tb_zone_selftest():
     assert not _tb_evicted_from_edge(True, False, False)
     assert not _tb_evicted_from_edge(False, False, True)
     assert not _tb_evicted_from_edge(True, True, False)
+    # Drag ghost: follows the cursor unclamped, and the click/drag phases.
+    assert _tb_ghost_origin((2500, 900), (200, 1056),
+                            (173, 1033, 334, 1079)) == (2473, 877)
+    assert _tb_ghost_origin((-300, 1056), (200, 1056),
+                            (173, 1033, 334, 1079)) == (-327, 1033)
+    pressed = _tb_drag_state(_TB_DRAG_IDLE, "press")
+    assert pressed == _TB_DRAG_PRESSED
+    assert _tb_drag_state(pressed, "move", False) == _TB_DRAG_PRESSED
+    assert _tb_drag_state(pressed, "release") == _TB_DRAG_IDLE
+    dragging = _tb_drag_state(pressed, "move", True)
+    assert dragging == _TB_DRAG_DRAGGING
+    assert _tb_drag_state(dragging, "move", False) == _TB_DRAG_DRAGGING
+    assert _tb_drag_state(dragging, "cancel") == _TB_DRAG_IDLE
+    assert (_TB_GHOST_ALPHA, _TB_DRAGGED_STRIP_ALPHA, _TB_OPAQUE_ALPHA) == (
+        153, 90, 255)
     # Dragging stays inside the host taskbar.
     assert _tb_clamp_to_host((-50, 1001, 111, 1047), bar)[0] == 0
     assert _tb_clamp_to_host((1900, 1001, 2061, 1047), bar)[2] == 1920
@@ -6280,8 +6341,12 @@ def _tb_premultiplied_bgra(image):
     return bytes(out)
 
 
-def _tb_publish(hwnd, image):
-    """Publish one per-pixel-alpha frame, releasing every temporary GDI handle."""
+def _tb_publish(hwnd, image, alpha=_TB_OPAQUE_ALPHA):
+    """Publish one per-pixel-alpha frame, releasing every temporary GDI handle.
+
+    `alpha` is the whole-window SourceConstantAlpha on top of the per-pixel
+    channel, which is how a dragged strip dims and its ghost stays
+    see-through."""
     width, height = image.size
     if width <= 0 or height <= 0:
         return
@@ -6310,7 +6375,7 @@ def _tb_publish(hwnd, image):
         pixels = _tb_premultiplied_bgra(image)
         ctypes.memmove(bits, pixels, len(pixels))
         source, size = _TB_POINT(0, 0), _TB_SIZE(width, height)
-        blend = _TB_BLENDFUNCTION(0, 0, 255, _TB_AC_SRC_ALPHA)
+        blend = _TB_BLENDFUNCTION(0, 0, alpha, _TB_AC_SRC_ALPHA)
         if not u.UpdateLayeredWindow(hwnd, screen_dc, None, ctypes.byref(size),
                                       memory_dc, ctypes.byref(source), 0,
                                       ctypes.byref(blend), _TB_ULW_ALPHA):
@@ -6320,6 +6385,61 @@ def _tb_publish(hwnd, image):
         g.DeleteObject(bitmap)
         g.DeleteDC(memory_dc)
         u.ReleaseDC(None, screen_dc)
+
+
+_TB_GHOST_WNDPROC = None
+_TB_GHOST_ATOM = None
+
+
+def _tb_create_ghost(image):
+    """A click-through, always-on-top copy of the strip that follows the drag.
+
+    SHARED STRIP CONTRACT — same styles and alphas as the Codex widget.
+    WS_EX_TRANSPARENT keeps every click going to whatever is underneath, so
+    the drop still lands on the taskbar the cursor is over."""
+    global _TB_GHOST_WNDPROC, _TB_GHOST_ATOM
+    u = _tb_u32()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    hinstance = kernel32.GetModuleHandleW(None)
+    if _TB_GHOST_ATOM is None:
+        _TB_GHOST_WNDPROC = _TB_WNDPROC(
+            lambda hwnd, message, wparam, lparam:
+            u.DefWindowProcW(hwnd, message, wparam, lparam))
+        wc = _TB_WNDCLASSW(lpfnWndProc=_TB_GHOST_WNDPROC, hInstance=hinstance,
+                           lpszClassName=_TB_GHOST_CLASS_NAME)
+        _TB_GHOST_ATOM = int(u.RegisterClassW(ctypes.byref(wc)) or 0)
+        if not _TB_GHOST_ATOM:
+            return 0
+    hwnd = int(u.CreateWindowExW(
+        _TB_WS_EX_LAYERED | _TB_WS_EX_TRANSPARENT | _TB_WS_EX_TOOLWINDOW
+        | _TB_WS_EX_NOACTIVATE | _TB_WS_EX_TOPMOST,
+        _TB_GHOST_CLASS_NAME, "", _TB_WS_POPUP,
+        0, 0, image.width, image.height, None, None, hinstance, None) or 0)
+    if not hwnd:
+        return 0
+    _tb_publish(hwnd, image, _TB_GHOST_ALPHA)
+    u.ShowWindow(hwnd, _TB_SW_SHOWNOACTIVATE)
+    return hwnd
+
+
+def _tb_move_ghost(hwnd, left, top):
+    """Park the ghost at a screen position, above everything, unclamped."""
+    _tb_u32().SetWindowPos(hwnd, ctypes.c_void_p(_TB_HWND_TOPMOST), left, top,
+                           0, 0, _TB_SWP_NOACTIVATE | _TB_SWP_NOSIZE)
+
+
+def _tb_destroy_ghost(hwnd):
+    """Tear the ghost down; safe to call twice and during shutdown."""
+    if not hwnd:
+        return
+    try:
+        u = _tb_u32()
+        if u.IsWindow(hwnd):
+            u.DestroyWindow(hwnd)
+    except Exception:
+        pass
 
 
 def _tb_light_theme():
@@ -6419,6 +6539,8 @@ class TaskbarSurface:
         self._press = None
         self._press_rect = None
         self._dragging = False
+        self._ghost = 0
+        self._last_image = None
 
     @property
     def available(self):
@@ -6565,6 +6687,11 @@ class TaskbarSurface:
             return
         finally:
             stop.set()
+            # A drag in flight when the widget exits must not leave its ghost
+            # (and its DIB section) behind.
+            with self._lock:
+                ghost, self._ghost = self._ghost, 0
+            _tb_destroy_ghost(ghost)
             if hwnd and u.IsWindow(hwnd):
                 u.DestroyWindow(hwnd)
             if atom:
@@ -6585,6 +6712,13 @@ class TaskbarSurface:
             return 1
         if message == _TB_WM_LBUTTONDOWN:
             self._begin_press(hwnd)
+            return 0
+        if message == _TB_WM_TIMER and wparam == _TB_DRAG_TIMER_ID:
+            # Esc reaches us through no window message (the strip never takes
+            # focus), so a small timer is what makes it work while the pointer
+            # stands still.
+            if u.GetAsyncKeyState(_TB_VK_ESCAPE) & 0x8001:
+                self._cancel_drag(hwnd)
             return 0
         if message == _TB_WM_CAPTURECHANGED:
             self._cancel_drag(hwnd)        # capture lost: treat as cancelled
@@ -6659,7 +6793,7 @@ class TaskbarSurface:
             press, rect, dragging = self._press, self._press_rect, self._dragging
         if press is None or rect is None:
             return False
-        if u.GetAsyncKeyState(_TB_VK_ESCAPE) & 0x8000:
+        if u.GetAsyncKeyState(_TB_VK_ESCAPE) & 0x8001:
             self._cancel_drag(hwnd)
             return True
         point = wintypes.POINT()
@@ -6672,15 +6806,37 @@ class TaskbarSurface:
                 return False               # still a click, not a drag
             with self._lock:
                 self._dragging = True
-        host = _tb_window_rect(int(u.GetParent(hwnd) or 0))
-        shift = point.x - press[0]
-        moved = (rect[0] + shift, rect[1], rect[2] + shift, rect[3])
-        if host is not None:
-            moved = _tb_clamp_to_host(moved, host)
-        u.SetWindowPos(hwnd, None, moved[0], moved[1],
-                       moved[2] - moved[0], moved[3] - moved[1],
-                       _TB_SWP_NOACTIVATE | _TB_SWP_NOZORDER)
+            self._start_ghost(hwnd)
+            u.SetTimer(hwnd, _TB_DRAG_TIMER_ID, _TB_DRAG_TIMER_MS, None)
+        # The strip itself never moves: the ghost carries the drag, so it can
+        # cross to another monitor while the original stays dimmed in place.
+        with self._lock:
+            ghost = self._ghost
+        if ghost:
+            left, top = _tb_ghost_origin((point.x, point.y), press, rect)
+            _tb_move_ghost(ghost, left, top)
         return True
+
+    def _start_ghost(self, hwnd):
+        """Raise the translucent copy and fade the strip that stays behind."""
+        with self._lock:
+            image = self._last_image
+        if image is None:
+            return
+        ghost = _tb_create_ghost(image)
+        with self._lock:
+            self._ghost = ghost
+        self._paint(hwnd)
+
+    def _end_ghost(self, hwnd):
+        """Drop the ghost, stop the Esc timer, restore full opacity."""
+        if hwnd:
+            _tb_u32().KillTimer(hwnd, _TB_DRAG_TIMER_ID)
+        with self._lock:
+            ghost, self._ghost = self._ghost, 0
+        _tb_destroy_ghost(ghost)
+        if hwnd:
+            self._paint(hwnd)
 
     def _finish_drag(self, hwnd):
         """Release a drag and report the drop. True when a drag was handled."""
@@ -6693,6 +6849,7 @@ class TaskbarSurface:
             return False                   # a synthetic release: nothing held
         u = _tb_u32()
         u.ReleaseCapture()
+        self._end_ghost(hwnd)
         if not dragging:
             return False
         point = wintypes.POINT()
@@ -6720,6 +6877,8 @@ class TaskbarSurface:
             return
         u = _tb_u32()
         u.ReleaseCapture()
+        # The strip never left its slot, so cancelling is just cleanup.
+        self._end_ghost(hwnd)
         u.PostMessageW(hwnd, _TB_WM_APP_LAYOUT, 0, 0)
 
     def _set_accessible_name(self, hwnd):
@@ -6740,10 +6899,15 @@ class TaskbarSurface:
                 return
             with self._lock:
                 rows, message, stale = self._rows, self._message, self._stale
-            _tb_publish(hwnd, _tb_render(
+            image = _tb_render(
                 rows, message, stale, bounds.right, bounds.bottom,
                 max(96, int(u.GetDpiForWindow(hwnd) or 96)),
-                _tb_light_theme(), _tb_high_contrast(), self._hover))
+                _tb_light_theme(), _tb_high_contrast(), self._hover)
+            with self._lock:
+                self._last_image = image
+                alpha = (_TB_DRAGGED_STRIP_ALPHA if self._dragging
+                         else _TB_OPAQUE_ALPHA)
+            _tb_publish(hwnd, image, alpha)
         except Exception:
             with self._lock:
                 self._attached = False
