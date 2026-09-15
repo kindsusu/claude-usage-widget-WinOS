@@ -99,7 +99,7 @@ EPHEMERAL_KEYS = {"refresh_seconds"}
 # Bump this together with the git tag (the release workflow refuses a tag
 # that does not match). Users on older versions compare against the latest
 # release tag and pull the new widget.pyw automatically.
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 # ---- Auto-update ----------------------------------------------------------
 # Release-gated: only a published GitHub Release reaches users, never a plain
@@ -5233,6 +5233,8 @@ _TB_WM_APP_UPDATE = 0x8001
 _TB_WM_APP_VISIBILITY = 0x8002
 _TB_WM_APP_STOP = 0x8003
 _TB_WM_APP_LAYOUT = 0x8004
+_TB_WM_APP_SWAP_READY = 0x8005
+_TB_WM_APP_SIBLING_ORDER = 0x8006
 _TB_WS_CHILD = 0x40000000
 _TB_WS_POPUP = 0x80000000
 _TB_WS_CLIPSIBLINGS = 0x04000000
@@ -5255,6 +5257,9 @@ _TB_WM_CAPTURECHANGED = 0x0215
 _TB_WM_TIMER = 0x0113
 _TB_DRAG_TIMER_ID = 1
 _TB_DRAG_TIMER_MS = 50
+_TB_SWAP_TIMER_ID = 2
+_TB_SWAP_TIMER_MS = 50
+_TB_SWAP_TIMEOUT_SECONDS = 2.0
 _TB_SM_CXDRAG = 68
 _TB_SM_CYDRAG = 69
 _TB_VK_ESCAPE = 0x1B
@@ -5655,13 +5660,17 @@ def _tb_choose_host(candidates, host, monitor):
     return (primary, True)
 
 
-def _tb_decide_drop(point, candidates, siblings=()):
-    """(candidate, zone, claim_edge) for a released drag, or None.
+def _tb_decide_drop(point, candidates, siblings=(), source=None,
+                    final_rect=None):
+    """(candidate, zone, claim_edge, edge_priority, yield_edge), or None.
 
     SHARED STRIP CONTRACT — mirrors codex decide_drop(). None means the strip
     was dropped outside every taskbar, which the caller reads as "keep the
     previous placement"."""
     x, y = point
+    if final_rect is not None:
+        x = (final_rect[0] + final_rect[2]) // 2
+        y = (final_rect[1] + final_rect[3]) // 2
     host = next(
         (item for item in candidates
          if item[1][0] <= x < item[1][2] and item[1][1] <= y < item[1][3]),
@@ -5672,16 +5681,44 @@ def _tb_decide_drop(point, candidates, siblings=()):
     middle = (bounds[0] + bounds[2]) // 2
     zone = _TB_ZONE_LEFT if x < middle else _TB_ZONE_RIGHT
     inside = tuple(r for r in siblings
-                   if r[0] < bounds[2] and r[2] > bounds[0])
-    # Dropped on the sibling's edge-facing half (or past it): the user aimed
-    # at that slot, so take it. Its inner half means "sit beside it".
+                   if r[0] < bounds[2] and r[2] > bounds[0]
+                   and r[1] < bounds[3] and r[3] > bounds[1])
+    # The sibling's whole surface is a swap target. Requiring the pointer to
+    # cross its midpoint made half of the visible strip a misleading dead zone.
+    # Points farther toward the outer edge keep the existing edge-claim gesture.
     if zone == _TB_ZONE_LEFT:
         same = tuple(r for r in inside if (r[0] + r[2]) // 2 < middle)
-        claim = bool(same) and x < min((r[0] + r[2]) // 2 for r in same)
+        claim = bool(same) and x < min(r[2] for r in same)
     else:
         same = tuple(r for r in inside if (r[0] + r[2]) // 2 >= middle)
-        claim = bool(same) and x > max((r[0] + r[2]) // 2 for r in same)
-    return (host, zone, claim)
+        claim = bool(same) and x >= max(r[0] for r in same)
+    if same and source is not None and final_rect is not None:
+        source_on_host = (source[0] < bounds[2] and source[2] > bounds[0]
+                          and source[1] < bounds[3] and source[3] > bounds[1])
+        if not source_on_host:
+            return (host, zone, claim, True if claim else None, False)
+        source_middle = (source[0] + source[2]) // 2
+        final_middle = (final_rect[0] + final_rect[2]) // 2
+        target = min(same, key=lambda r: abs((r[0] + r[2]) // 2
+                                             - source_middle))
+        target_middle = (target[0] + target[2]) // 2
+        source_at_edge = (source_middle < target_middle if zone == _TB_ZONE_LEFT
+                          else source_middle > target_middle)
+        final_at_edge = (final_middle < target_middle if zone == _TB_ZONE_LEFT
+                         else final_middle > target_middle)
+        overlaps_target = (final_rect[0] < target[2]
+                           and final_rect[2] > target[0]
+                           and final_rect[1] < target[3]
+                           and final_rect[3] > target[1])
+        if overlaps_target:
+            # Equal centers have no side, but full overlap remains a swap.
+            final_at_edge = not source_at_edge
+        if source_at_edge == final_at_edge:
+            return (host, zone, False, None, False)
+        if source_at_edge:
+            return (host, zone, False, False, True)
+        return (host, zone, True, True, False)
+    return (host, zone, claim, True if claim else None, False)
 
 
 def _tb_edge_anchor(taskbar, notify, zone, gap, margin, width):
@@ -5744,6 +5781,13 @@ def _tb_ghost_origin(cursor, press, origin):
     the user a drop over there is possible."""
     return (origin[0] + cursor[0] - press[0],
             origin[1] + cursor[1] - press[1])
+
+
+def _tb_ghost_rect(cursor, press, origin):
+    """Final ghost bounds, preserving where inside the strip it was grabbed."""
+    left, top = _tb_ghost_origin(cursor, press, origin)
+    return (left, top, left + origin[2] - origin[0],
+            top + origin[3] - origin[1])
 
 
 def _tb_drag_state(state, event, beyond_threshold=False):
@@ -5821,20 +5865,68 @@ def _tb_zone_selftest():
                            "") == (primary, False)
     # Drop decisions: host, zone, and the sibling-slot claim.
     hosts = (primary, second)
-    assert _tb_decide_drop((300, 1020), hosts) == (primary, _TB_ZONE_LEFT,
-                                                    False)
-    assert _tb_decide_drop((1700, 1020), hosts) == (primary, _TB_ZONE_RIGHT,
-                                                     False)
-    assert _tb_decide_drop((2000, 1020), hosts) == (second, _TB_ZONE_LEFT,
-                                                     False)
+    assert _tb_decide_drop((300, 1020), hosts)[:3] == (
+        primary, _TB_ZONE_LEFT, False)
+    assert _tb_decide_drop((1700, 1020), hosts)[:3] == (
+        primary, _TB_ZONE_RIGHT, False)
+    assert _tb_decide_drop((2000, 1020), hosts)[:3] == (
+        second, _TB_ZONE_LEFT, False)
     assert _tb_decide_drop((500, 400), hosts) is None
     assert _tb_decide_drop((300, 1020), (primary,), (sib_l,))[2] is False
-    assert _tb_decide_drop((20, 1020), (primary,), (sib_l,))[2] is True
+    for x in (8, 20, 87, 88, 120, 168):
+        assert _tb_decide_drop((x, 1020), (primary,), (sib_l,))[2] is True
     assert _tb_decide_drop((1500, 1020), (primary,), (sib_r,))[2] is False
-    assert _tb_decide_drop((1800, 1020), (primary,), (sib_r,))[2] is True
+    for x in (1575, 1600, 1655, 1656, 1700, 1735, 1800):
+        assert _tb_decide_drop((x, 1020), (primary,), (sib_r,))[2] is True
     # A sibling on the other taskbar never blocks this one's edge.
     far = (1928, 1000, 2089, 1048)
     assert _tb_decide_drop((20, 1020), hosts, (far,))[2] is False
+    # A sibling outside the target taskbar's vertical band is also unrelated.
+    above = (8, 900, 169, 948)
+    assert _tb_decide_drop((20, 1020), (primary,), (above,))[2] is False
+    edge, inner = (8, 1000, 169, 1048), (173, 1000, 334, 1048)
+    assert _tb_decide_drop(
+        (500, 1020), (primary,), (inner,), edge,
+        (420, 1000, 581, 1048))[2:] == (False, False, True)
+    assert _tb_decide_drop(
+        (20, 1020), (primary,), (edge,), inner,
+        (-60, 1000, 101, 1048))[2:] == (True, True, False)
+    assert _tb_decide_drop(
+        (253, 1020), (primary,), (inner,), edge, inner)[2:] == (
+            False, False, True)
+    assert _tb_decide_drop(
+        (88, 1020), (primary,), (edge,), inner, edge)[2:] == (
+            True, True, False)
+    secondary_target = (1928, 1000, 2089, 1048)
+    assert _tb_decide_drop(
+        (2000, 1020), hosts, (secondary_target,), edge,
+        (1920, 1000, 2081, 1048))[2:] == (
+            True, True, False)
+    # Passing a sibling into empty space still changes insertion order.
+    for left in (254, 334, 400, 500):
+        assert _tb_decide_drop(
+            (left + 80, 1020), (primary,), (inner,), edge,
+            (left, 1000, left + 161, 1048))[2:] == (False, False, True)
+    edge_r, inner_r = (1575, 1000, 1736, 1048), (1410, 1000, 1571, 1048)
+    assert _tb_decide_drop(
+        (1800, 1020), (primary,), (edge_r,), inner_r,
+        (1720, 1000, 1881, 1048))[2:] == (True, True, False)
+    assert _tb_decide_drop(
+        (1250, 1020), (primary,), (inner_r,), edge_r,
+        (1170, 1000, 1331, 1048))[2:] == (False, False, True)
+    assert _tb_decide_drop(
+        (80, 1020), (primary,), (inner,), edge,
+        (0, 1000, 161, 1048))[2:] == (False, None, False)
+    # Equal final ghost geometry gives the same result for either grab edge.
+    from_left = _tb_ghost_rect((410, 1020), (18, 1020), edge)
+    from_right = _tb_ghost_rect((551, 1020), (159, 1020), edge)
+    assert from_left == from_right == (400, 1000, 561, 1048)
+    assert _tb_decide_drop(
+        (410, 1020), (primary,), (inner,), edge, from_left)[2:] == (
+            False, False, True)
+    assert _tb_decide_drop(
+        (551, 1020), (primary,), (inner,), edge, from_right)[2:] == (
+            False, False, True)
     # Edge order: priority claims, no-priority waits then sweeps.
     assert _tb_start_slot(True, False, 0.0) == _TB_SLOT_CLAIM
     assert _tb_start_slot(True, True, 99.0) == _TB_SLOT_CLAIM
@@ -5965,6 +6057,23 @@ def _tb_sibling_rects(taskbar, own_hwnd):
     return tuple(found)
 
 
+def _tb_notify_sibling_order(taskbar, own_hwnd, priority):
+    """Give siblings their explicit order and wake one fresh geometry scan."""
+    u = _tb_u32()
+
+    @_TB_ENUMPROC
+    def visit(hwnd, _):
+        if hwnd != own_hwnd:
+            name = ctypes.create_unicode_buffer(128)
+            u.GetClassNameW(hwnd, name, len(name))
+            if name.value.startswith(_TB_SIBLING_PREFIXES):
+                u.PostMessageW(
+                    hwnd, _TB_WM_APP_SIBLING_ORDER, int(bool(priority)), 0)
+        return True
+
+    u.EnumChildWindows(taskbar, visit, 0)
+
+
 def _tb_uia_regions(taskbar, bounds):
     """(class_name, rect) for everything on the bar we must not cover.
 
@@ -6086,7 +6195,7 @@ def _tb_host_under_point(x, y):
 
 def _tb_find_target(own_hwnd, zone=_TB_ZONE_LEFT, host=_TB_HOST_PRIMARY,
                     monitor="", claim_edge=False, priority=False,
-                    waited=_TB_EDGE_HOLD_SECONDS):
+                    waited=_TB_EDGE_HOLD_SECONDS, yield_edge=False):
     """(taskbar_hwnd, taskbar_rect, placement_rect, dpi, fallback, claiming).
 
     Re-resolves the host on every scan, so an Explorer restart or a monitor
@@ -6134,6 +6243,12 @@ def _tb_find_target(own_hwnd, zone=_TB_ZONE_LEFT, host=_TB_HOST_PRIMARY,
         candidate = (reserved, placement[1], reserved + width, placement[3])
         if not any(_tb_intersects(candidate, r) for r in regions):
             placement = candidate
+    if yield_edge:
+        # Vacate the edge immediately and hold the second slot until the
+        # sibling accepts the edge side of the swap.
+        reserved = _tb_second_slot_left(bounds, notify, zone, gap, margin,
+                                        width)
+        placement = (reserved, placement[1], reserved + width, placement[3])
     claiming = False
     if claim:
         # Keep claiming until the sibling has actually moved: once both
@@ -6511,6 +6626,7 @@ class TaskbarSurface:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._stop = threading.Event()
+        self._rescan = threading.Event()
         self._thread = None
         self._observer = None
         self._rows = ()
@@ -6530,6 +6646,7 @@ class TaskbarSurface:
         self._claim_edge = False
         # SHARED STRIP CONTRACT: edge-order bookkeeping.
         self._priority = False
+        self._yield_edge = False
         self._started_at = time.monotonic()
         # When a user drag last put this strip on the edge by hand.
         self._explicit_until = 0.0
@@ -6541,6 +6658,14 @@ class TaskbarSurface:
         self._dragging = False
         self._ghost = 0
         self._last_image = None
+        self._swap_pending = False
+        self._swap_deadline = 0.0
+        self._swap_source = None
+        self._swap_target = None
+        self._swap_parent = 0
+        self._swap_bounds = None
+        self._swap_sibling_ready = False
+        self._swap_original_priority = False
 
     @property
     def available(self):
@@ -6555,15 +6680,16 @@ class TaskbarSurface:
         return bool(target is not None and len(target) > 4 and target[4])
 
     def set_placement(self, zone, host, monitor, claim_edge=False,
-                      priority=False):
+                      priority=False, yield_edge=False):
         """Publish new saved placement settings to the native worker."""
         with self._lock:
-            state = (zone, host, monitor, claim_edge, priority)
+            state = (zone, host, monitor, claim_edge, priority, yield_edge)
             if state == (self._zone, self._host, self._monitor,
-                         self._claim_edge, self._priority):
+                         self._claim_edge, self._priority, self._yield_edge):
                 return
             (self._zone, self._host, self._monitor, self._claim_edge,
-             self._priority) = state
+             self._priority, self._yield_edge) = state
+            self._rescan.set()
             if claim_edge:
                 # A hand-placed claim outranks the sibling's automatic one.
                 self._explicit_until = (time.monotonic()
@@ -6633,6 +6759,7 @@ class TaskbarSurface:
         with self._lock:
             thread, hwnd = self._thread, self._hwnd
             self._stop.set()
+            self._rescan.set()
         if hwnd:
             _tb_u32().PostMessageW(hwnd, _TB_WM_APP_STOP, 0, 0)
         if thread is not None and thread.ident != threading.get_ident():
@@ -6720,6 +6847,12 @@ class TaskbarSurface:
             if u.GetAsyncKeyState(_TB_VK_ESCAPE) & 0x8001:
                 self._cancel_drag(hwnd)
             return 0
+        if message == _TB_WM_TIMER and wparam == _TB_SWAP_TIMER_ID:
+            if u.GetAsyncKeyState(_TB_VK_ESCAPE) & 0x8001:
+                self._abort_swap_transition(hwnd)
+            else:
+                self._settle_swap_transition(hwnd)
+            return 0
         if message == _TB_WM_CAPTURECHANGED:
             self._cancel_drag(hwnd)        # capture lost: treat as cancelled
             return 0
@@ -6762,6 +6895,12 @@ class TaskbarSurface:
             return 0
         if message == _TB_WM_APP_LAYOUT:
             self._apply_target()
+            return 0
+        if message == _TB_WM_APP_SWAP_READY:
+            self._complete_swap_transition(hwnd)
+            return 0
+        if message == _TB_WM_APP_SIBLING_ORDER:
+            self._accept_sibling_order(bool(wparam))
             return 0
         if message == _TB_WM_APP_STOP:
             u.DestroyWindow(hwnd)
@@ -6838,30 +6977,182 @@ class TaskbarSurface:
         if hwnd:
             self._paint(hwnd)
 
+    def _begin_swap_transition(self, hwnd, decision, source, siblings):
+        """Move invisibly into the sibling slot while it takes the edge."""
+        candidate, zone = decision[0], decision[1]
+        bounds = candidate[1]
+        middle = (bounds[0] + bounds[2]) // 2
+        candidates = tuple(
+            item for item in siblings
+            if item[0] < bounds[2] and item[2] > bounds[0]
+            and item[1] < bounds[3] and item[3] > bounds[1]
+            and (((item[0] + item[2]) // 2 < middle)
+                 == (zone == _TB_ZONE_LEFT)))
+        if not candidates:
+            return False
+        source_middle = (source[0] + source[2]) // 2
+        sibling = min(candidates, key=lambda item: abs(
+            (item[0] + item[2]) // 2 - source_middle))
+        target = (sibling[0], sibling[1],
+                  sibling[0] + source[2] - source[0],
+                  sibling[1] + source[3] - source[1])
+        with self._lock:
+            self._swap_pending = True
+            self._swap_deadline = time.monotonic() + _TB_SWAP_TIMEOUT_SECONDS
+            self._swap_source = source
+            self._swap_target = target
+            self._swap_parent = candidate[0]
+            self._swap_bounds = bounds
+            self._swap_sibling_ready = False
+            self._swap_original_priority = not bool(decision[3])
+            ghost, self._ghost = self._ghost, 0
+        # Publish alpha 0 before moving into the occupied sibling slot.
+        self._paint(hwnd)
+        _tb_destroy_ghost(ghost)
+        try:
+            if int(_tb_u32().GetParent(hwnd) or 0) == candidate[0]:
+                _tb_position(hwnd, target, bounds)
+            elif not _tb_attach(hwnd, candidate[0], target, bounds):
+                raise OSError
+        except OSError:
+            self._abort_swap_transition(hwnd)
+            return False
+        u = _tb_u32()
+        u.KillTimer(hwnd, _TB_DRAG_TIMER_ID)
+        u.SetTimer(hwnd, _TB_SWAP_TIMER_ID, _TB_SWAP_TIMER_MS, None)
+        _tb_notify_sibling_order(
+            candidate[0], hwnd, not bool(decision[3]))
+        return True
+
+    def _settle_swap_transition(self, hwnd):
+        """Reveal only after the sibling vacates our invisible final slot."""
+        with self._lock:
+            pending = self._swap_pending
+            deadline = self._swap_deadline
+            source, target = self._swap_source, self._swap_target
+            parent = self._swap_parent
+        if not pending or source is None or target is None or not parent:
+            return
+        siblings = _tb_sibling_rects(parent, hwnd)
+        sibling_at_source = any(_tb_intersects(item, source)
+                                for item in siblings)
+        target_clear = not any(_tb_intersects(item, target)
+                               for item in siblings)
+        if sibling_at_source and target_clear:
+            with self._lock:
+                self._swap_sibling_ready = True
+            self._rescan.set()
+        elif time.monotonic() >= deadline:
+            self._abort_swap_transition(hwnd)
+
+    def _clear_swap_transition(self, hwnd):
+        if hwnd:
+            _tb_u32().KillTimer(hwnd, _TB_SWAP_TIMER_ID)
+        with self._lock:
+            ghost, self._ghost = self._ghost, 0
+            self._swap_pending = False
+            self._swap_deadline = 0.0
+            self._swap_source = self._swap_target = None
+            self._swap_parent = 0
+            self._swap_bounds = None
+            self._swap_sibling_ready = False
+        return ghost
+
+    def _complete_swap_transition(self, hwnd):
+        with self._lock:
+            target = self._target
+            expected, parent = self._swap_target, self._swap_parent
+        if (target is None or expected is None or target[0] != parent
+                or target[2][0] != expected[0] or target[2][2] != expected[2]
+                or any(_tb_intersects(item, target[2])
+                       for item in _tb_sibling_rects(parent, hwnd))):
+            return
+        try:
+            _tb_position(hwnd, target[2], target[1])
+        except OSError:
+            self._abort_swap_transition(hwnd)
+            return
+        _tb_destroy_ghost(self._clear_swap_transition(hwnd))
+        self._paint(hwnd)
+
+    def _abort_swap_transition(self, hwnd):
+        with self._lock:
+            source, parent = self._swap_source, self._swap_parent
+            bounds = self._swap_bounds
+            original_priority = self._swap_original_priority
+        if source is not None and parent and bounds is not None:
+            try:
+                _tb_position(hwnd, source, bounds)
+            except OSError:
+                pass
+        with self._lock:
+            self._priority = original_priority
+            self._claim_edge = self._yield_edge = False
+        _tb_destroy_ghost(self._clear_swap_transition(hwnd))
+        try:
+            self._on_priority(original_priority)
+        except Exception:
+            pass
+        if parent:
+            _tb_notify_sibling_order(parent, hwnd, not original_priority)
+        self._paint(hwnd)
+
+    def _accept_sibling_order(self, priority):
+        """Apply the other strip's explicit swap half and wake one fresh scan."""
+        with self._lock:
+            self._priority = bool(priority)
+            self._claim_edge = bool(priority)
+            self._yield_edge = False
+            if priority:
+                self._explicit_until = (time.monotonic()
+                                        + _TB_EDGE_EXPLICIT_SECONDS)
+        try:
+            self._on_priority(bool(priority))
+        except Exception:
+            pass
+        self._rescan.set()
+
     def _finish_drag(self, hwnd):
         """Release a drag and report the drop. True when a drag was handled."""
         with self._lock:
             pressed = self._press is not None
             dragging = self._dragging
+            press = self._press
+            source = self._press_rect
             self._press = self._press_rect = None
             self._dragging = False
         if not pressed and not dragging:
             return False                   # a synthetic release: nothing held
         u = _tb_u32()
         u.ReleaseCapture()
-        self._end_ghost(hwnd)
         if not dragging:
+            self._end_ghost(hwnd)
             return False
         point = wintypes.POINT()
-        if u.GetCursorPos(ctypes.byref(point)):
+        if (u.GetCursorPos(ctypes.byref(point))
+                and press is not None and source is not None):
+            hosts = _tb_hosts()
+            final_rect = _tb_ghost_rect(
+                (point.x, point.y), press, source)
+            siblings = tuple(sibling
+                             for host in hosts
+                             for sibling in _tb_sibling_rects(host[0], hwnd))
             decision = _tb_decide_drop(
-                (point.x, point.y), _tb_hosts(),
-                _tb_sibling_rects(int(u.GetParent(hwnd) or 0), hwnd))
+                (point.x, point.y), hosts,
+                siblings, source, final_rect)
             if decision is not None:
-                try:
-                    self._on_move(decision)
-                except Exception:
-                    pass
+                source_on_host = _tb_intersects(source, decision[0][1])
+                wants_swap = decision[3] is not None and source_on_host
+                transition = (wants_swap and self._begin_swap_transition(
+                    hwnd, decision, source, siblings))
+                if not wants_swap or transition:
+                    try:
+                        self._on_move(decision)
+                    except Exception:
+                        pass
+                if transition:
+                    return True
+        self._end_ghost(hwnd)
         # Either way, snap back to a computed placement instead of the
         # free-hand position the pointer left behind.
         u.PostMessageW(hwnd, _TB_WM_APP_LAYOUT, 0, 0)
@@ -6905,8 +7196,9 @@ class TaskbarSurface:
                 _tb_light_theme(), _tb_high_contrast(), self._hover)
             with self._lock:
                 self._last_image = image
-                alpha = (_TB_DRAGGED_STRIP_ALPHA if self._dragging
-                         else _TB_OPAQUE_ALPHA)
+                alpha = (0 if self._swap_pending else
+                         (_TB_DRAGGED_STRIP_ALPHA if self._dragging
+                          else _TB_OPAQUE_ALPHA))
             _tb_publish(hwnd, image, alpha)
         except Exception:
             with self._lock:
@@ -6922,10 +7214,12 @@ class TaskbarSurface:
                 zone, host = self._zone, self._host
                 monitor, claim = self._monitor, self._claim_edge
                 priority, started = self._priority, self._started_at
+                yield_edge = self._yield_edge
                 was_at_edge, scans = self._was_at_edge, self._claim_scans
             try:
                 target = _tb_find_target(hwnd, zone, host, monitor, claim,
-                                         priority, time.monotonic() - started)
+                                         priority, time.monotonic() - started,
+                                         yield_edge)
             except Exception:
                 target = None
             if stop.is_set():
@@ -6941,9 +7235,21 @@ class TaskbarSurface:
                 if claim and target is not None and not target[5]:
                     # The sibling stepped aside: stop ignoring it.
                     self._claim_edge = False
-            if not _tb_u32().PostMessageW(hwnd, _TB_WM_APP_LAYOUT, 0, 0):
+                if yield_edge and target is not None and target[7]:
+                    self._yield_edge = False
+                swap_ready = (self._swap_pending
+                              and self._swap_sibling_ready)
+            if (swap_ready and target is not None
+                    and target[0] == self._swap_parent):
+                if not _tb_u32().PostMessageW(
+                        hwnd, _TB_WM_APP_SWAP_READY, 0, 0):
+                    return
+            elif not _tb_u32().PostMessageW(
+                    hwnd, _TB_WM_APP_LAYOUT, 0, 0):
                 return
-            if stop.wait(_TB_POLL_MS / 1000.0):
+            if self._rescan.wait(_TB_POLL_MS / 1000.0):
+                self._rescan.clear()
+            if stop.is_set():
                 return
 
     def _settle_edge_priority(self, target, priority, was_at_edge, scans):
@@ -6983,6 +7289,9 @@ class TaskbarSurface:
         u = _tb_u32()
         with self._lock:
             hwnd, target = self._hwnd, self._target
+            swap_pending = self._swap_pending
+        if swap_pending:
+            return
         if not hwnd or target is None:
             with self._lock:
                 self._attached = False
@@ -8998,7 +9307,8 @@ class Widget:
             return "선택한 작업표시줄 없음 · 주 작업표시줄 사용 중"
         return None
 
-    def _set_taskbar_placement(self, zone, host, monitor=None, claim_edge=False):
+    def _set_taskbar_placement(self, zone, host, monitor=None, claim_edge=False,
+                               yield_edge=False):
         """Persist a new strip destination and re-embed straight away.
 
         SHARED STRIP CONTRACT — mirrors the Codex widget's
@@ -9024,17 +9334,18 @@ class Widget:
         if self.taskbar is not None:
             self.taskbar.set_placement(
                 zone, host, self.cfg["taskbar_host_monitor"], claim_edge,
-                bool(self.cfg.get("taskbar_edge_priority", False)))
+                bool(self.cfg.get("taskbar_edge_priority", False)),
+                yield_edge)
 
     def _apply_taskbar_drop(self, decision):
         """Save where the user dropped the strip, then claim the slot."""
-        candidate, zone, claim = decision
+        candidate, zone, claim, priority, yield_edge = decision
         host = _TB_HOST_PRIMARY if candidate[3] else _TB_HOST_SECONDARY
         monitor = "" if candidate[3] else candidate[2]
-        if claim:
-            # Taking the edge by hand is a lasting decision, not a one-off.
-            self.cfg["taskbar_edge_priority"] = True
-        self._set_taskbar_placement(zone, host, monitor, claim)
+        if priority is not None:
+            self.cfg["taskbar_edge_priority"] = priority
+        self._set_taskbar_placement(
+            zone, host, monitor, claim, yield_edge)
 
     def _apply_edge_priority(self, priority):
         """Persist an edge-order change the native worker just observed.
