@@ -99,7 +99,7 @@ EPHEMERAL_KEYS = {"refresh_seconds"}
 # Bump this together with the git tag (the release workflow refuses a tag
 # that does not match). Users on older versions compare against the latest
 # release tag and pull the new widget.pyw automatically.
-__version__ = "2.0.2"
+__version__ = "2.0.3"
 
 # ---- Auto-update ----------------------------------------------------------
 # Release-gated: only a published GitHub Release reaches users, never a plain
@@ -169,15 +169,24 @@ def _python_launcher():
     return [_python_exe(), __file__]
 
 
-def _update_log(msg):
-    """Append one line to widget.log beside the script. Update events are the
-    one thing worth a trace: a user reporting "it vanished and came back" can
-    be answered from this file."""
+def _log(msg, tag):
+    """Append one line to widget.log beside the script. Only events a user
+    would otherwise have to guess at are logged: self-updates ("it vanished
+    and came back") and token refresh/save outcomes ("it keeps saying token
+    refresh"). Never log token values."""
     try:
         with open(BASE_DIR / "widget.log", "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [update] {msg}\n")
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [{tag}] {msg}\n")
     except Exception:
         pass
+
+
+def _update_log(msg):
+    _log(msg, "update")
+
+
+def _auth_log(msg):
+    _log(msg, "auth")
 
 
 def _parse_version(tag):
@@ -7511,14 +7520,166 @@ _auth_fail_streak = 0
 AUTH_FAIL_THRESHOLD = 3
 
 
-def read_token():
-    """Return (access_token, expires_at_ms). Either may be None when the
-    credentials file is missing or momentarily unreadable."""
+# ---- Refreshed tokens that could not be saved -----------------------------
+# Refresh tokens ROTATE: the grant we POST is invalidated the moment the server
+# answers. So a refresh whose write-back fails leaves the ONLY live grant in
+# this process. 2026-09-28 incident: os.replace() onto .credentials.json failed
+# on Windows (file held open by another process), the error was swallowed, the
+# next poll re-read the dead grant from disk, got 400, and the widget sat on
+# "토큰 갱신 중…" until a manual re-login. Now such tokens are kept here, used
+# in preference to the stale file, and re-saved on every poll until it sticks.
+CREDS_TMP_PATH = CREDS_PATH.with_name(CREDS_PATH.name + ".tmp")
+_OAUTH_TOKEN_KEYS = ("accessToken", "refreshToken", "expiresAt")
+_pending_oauth = None            # {"accessToken","refreshToken","expiresAt"} | None
+_pending_lock = threading.Lock()  # guards _pending_oauth only; never held over I/O
+_last_net_log = 0.0              # throttle for network-error log lines
+
+
+def pick_effective_oauth(disk, pending):
+    """Pure. Decide which token set is authoritative: what is on disk, or the
+    unsaved set this process minted. Returns (oauth, keep_pending).
+
+    Disk wins whenever it already carries our grant (the save landed) or a
+    DIFFERENT grant that expires no earlier than ours (a re-login or Claude
+    Code wrote something newer — ours is obsolete). Otherwise the pending set
+    is the live one and the file is stale."""
+    if not pending or not pending.get("refreshToken"):
+        return disk, False
+    if not disk or not disk.get("refreshToken"):
+        return pending, True
+    if disk.get("refreshToken") == pending.get("refreshToken"):
+        return disk, False
+    if (disk.get("expiresAt") or 0) >= (pending.get("expiresAt") or 0):
+        return disk, False
+    return pending, True
+
+
+def _set_pending(oauth, only_if=None):
+    """Replace the pending set. With only_if, clear it only if it is still the
+    object the caller looked at (a concurrent refresh may have replaced it)."""
+    global _pending_oauth
+    with _pending_lock:
+        if only_if is None or _pending_oauth is only_if:
+            _pending_oauth = oauth
+
+
+def _read_creds():
+    return json.loads(CREDS_PATH.read_text(encoding="utf-8"))
+
+
+def _merge_oauth(creds, oauth):
+    """Copy only the three token fields into creds; every other key (scopes,
+    subscriptionType, refreshTokenExpiresAt, mcpOAuth, …) is left as the file
+    has it."""
+    cur = dict(creds.get("claudeAiOauth") or {})
+    for k in _OAUTH_TOKEN_KEYS:
+        cur[k] = oauth[k]
+    creds["claudeAiOauth"] = cur
+    return creds
+
+
+def _write_creds_atomic(creds, attempts=6, log_failure=True):
+    """Write tmp + os.replace, retrying: on Windows the rename fails while
+    another process has the file open without FILE_SHARE_DELETE, which is
+    usually a momentary collision with Claude Code rewriting the same file.
+    Must run off the Tk thread (it sleeps up to ~3 s). On final failure the
+    .tmp stays behind on purpose — it is the on-disk copy of the live grant,
+    adopted at the next launch by adopt_orphan_creds_tmp()."""
+    payload = json.dumps(creds, indent=2)
+    err = None
+    for i in range(attempts):
+        try:
+            CREDS_TMP_PATH.write_text(payload, encoding="utf-8")
+            os.replace(CREDS_TMP_PATH, CREDS_PATH)
+            return True
+        except OSError as e:
+            err = e
+            time.sleep(0.15 * (i + 1))
+    if log_failure:
+        _auth_log(f"save failed after {attempts} tries ({type(err).__name__}: {err}); "
+                  "keeping the new token in memory and retrying every poll")
+    return False
+
+
+def _persist_pending():
+    """Retry saving an unsaved token set. Called at the start of every poll
+    (worker thread). Quiet on repeated failure; logs once when it lands."""
+    p = _pending_oauth
+    if p is None:
+        return
+    with _refresh_lock:
+        try:
+            creds = _read_creds()
+        except Exception:
+            return
+        _, keep = pick_effective_oauth(creds.get("claudeAiOauth") or {}, p)
+        if not keep:
+            _set_pending(None, only_if=p)
+            return
+        if _write_creds_atomic(_merge_oauth(creds, p), log_failure=False):
+            _set_pending(None, only_if=p)
+            _auth_log("unsaved token saved to .credentials.json")
+
+
+def adopt_orphan_creds_tmp():
+    """At launch: a .credentials.json.tmp holding a NEWER grant than the file
+    means an earlier run minted tokens and failed to rename them in. That tmp
+    is the only surviving copy of the live refresh token, so adopt it as the
+    pending set (it will be refreshed and saved on the first poll)."""
     try:
-        oauth = json.loads(CREDS_PATH.read_text(encoding="utf-8")).get("claudeAiOauth", {})
-        return oauth.get("accessToken"), oauth.get("expiresAt")
+        tmp = json.loads(CREDS_TMP_PATH.read_text(encoding="utf-8")).get("claudeAiOauth") or {}
     except Exception:
+        return
+    if not all(tmp.get(k) for k in _OAUTH_TOKEN_KEYS):
+        return
+    try:
+        disk = _read_creds().get("claudeAiOauth") or {}
+    except Exception:
+        disk = {}
+    cand = {k: tmp[k] for k in _OAUTH_TOKEN_KEYS}
+    _, keep = pick_effective_oauth(disk, cand)
+    if keep:
+        _set_pending(cand)
+        _auth_log("found a newer token left in .credentials.json.tmp by a failed save; adopting it")
+
+
+def _auth_selftest():
+    """Pin pick_effective_oauth's decisions. Run by --selftest (pure)."""
+    disk = {"accessToken": "a1", "refreshToken": "r1", "expiresAt": 100}
+    mine = {"accessToken": "a2", "refreshToken": "r2", "expiresAt": 200}
+    assert pick_effective_oauth(disk, None) == (disk, False)
+    # save failed: file still has the rotated-away grant -> ours is live
+    assert pick_effective_oauth(disk, mine) == (mine, True)
+    # save landed: same grant on disk -> disk is authoritative
+    assert pick_effective_oauth(dict(mine), mine)[1] is False
+    # re-login wrote a newer, different grant -> drop ours
+    relogin = {"accessToken": "a3", "refreshToken": "r3", "expiresAt": 300}
+    assert pick_effective_oauth(relogin, mine) == (relogin, False)
+    # file momentarily unreadable/empty -> keep ours
+    assert pick_effective_oauth({}, mine) == (mine, True)
+    merged = _merge_oauth({"mcpOAuth": {"x": 1},
+                           "claudeAiOauth": {"scopes": ["s"], **disk}}, mine)
+    assert merged["mcpOAuth"] == {"x": 1}
+    assert merged["claudeAiOauth"]["scopes"] == ["s"]
+    assert merged["claudeAiOauth"]["refreshToken"] == "r2"
+
+
+def read_token():
+    """Return (access_token, expires_at_ms) from whichever token set is live:
+    the credentials file, or an unsaved refresh held in memory. Either value
+    may be None when nothing is readable. Never writes, never blocks — it is
+    also called on the Tk thread."""
+    try:
+        disk = _read_creds().get("claudeAiOauth") or {}
+    except Exception:
+        disk = None
+    p = _pending_oauth
+    if disk is None and p is None:
         return None, None
+    oauth, keep = pick_effective_oauth(disk or {}, p)
+    if p is not None and not keep:
+        _set_pending(None, only_if=p)
+    return oauth.get("accessToken"), oauth.get("expiresAt")
 
 
 # OAuth refresh — public client_id, identical for every Claude Code install.
@@ -7543,15 +7704,20 @@ def refresh_token():
     Handles refresh-token rotation: the response usually contains a NEW
     refresh_token that must be persisted, or the next refresh 400s.
     Re-reads the file inside the lock so we never clobber a token Claude
-    Code itself just rotated.
+    Code itself just rotated. If the save fails, the new set is kept as the
+    pending set (see _pending_oauth) so the rotated grant is never lost.
     """
-    global _dead_refresh_token, _refresh_backoff_until
+    global _dead_refresh_token, _refresh_backoff_until, _last_net_log
     with _refresh_lock:
         try:
-            creds = json.loads(CREDS_PATH.read_text(encoding="utf-8"))
+            creds = _read_creds()
         except Exception:
+            creds = None
+        # The live grant may be an unsaved one from an earlier refresh.
+        oauth, _ = pick_effective_oauth(
+            ((creds or {}).get("claudeAiOauth") or {}), _pending_oauth)
+        if not oauth:
             return None, None
-        oauth = creds.get("claudeAiOauth", {})
         rtok = oauth.get("refreshToken")
         if not rtok:
             return None, None
@@ -7592,6 +7758,8 @@ def refresh_token():
         except urllib.error.HTTPError as e:
             if e.code in (400, 401, 403):
                 _dead_refresh_token = rtok  # permanent: invalid/rotated grant
+                _auth_log(f"refresh rejected: HTTP {e.code} — grant is dead; "
+                          "waiting for a re-login (claude auth login)")
             elif e.code == 429 or e.code >= 500:
                 # Transient, but back off so we don't re-POST every poll and
                 # keep the endpoint rate-limited. Respect Retry-After; else 15m.
@@ -7599,30 +7767,40 @@ def refresh_token():
                     retry_s = int(e.headers.get("Retry-After", "0") or 0)
                 except (TypeError, ValueError):
                     retry_s = 0
-                _refresh_backoff_until = now_ms + max(retry_s, 900) * 1000
+                wait_s = max(retry_s, 900)
+                _refresh_backoff_until = now_ms + wait_s * 1000
+                _auth_log(f"refresh failed: HTTP {e.code} — backing off {wait_s // 60} min")
+            else:
+                _auth_log(f"refresh failed: HTTP {e.code}")
             return None, None
-        except Exception:
-            return None, None  # network error — transient, retry later
+        except Exception as e:
+            # Network error — transient, retry next poll. Log at most hourly so
+            # an outage leaves a trace without flooding the file every 180 s.
+            if time.time() - _last_net_log > 3600:
+                _last_net_log = time.time()
+                _auth_log(f"refresh failed: {type(e).__name__}: {e}")
+            return None, None
 
         access = data.get("access_token")
         if not access:
+            _auth_log("refresh failed: response had no access_token")
             return None, None
         _dead_refresh_token = None
         _refresh_backoff_until = 0.0
-        expires_at = int(now_ms) + int(data.get("expires_in", 28800)) * 1000
-        oauth["accessToken"] = access
-        oauth["refreshToken"] = data.get("refresh_token", rtok)  # rotation-safe
-        oauth["expiresAt"] = expires_at
-        creds["claudeAiOauth"] = oauth
-        # Atomic write: a crash mid-write must never corrupt the credentials
-        # file shared with Claude Code (that would break login for everything).
-        try:
-            tmp = CREDS_PATH.with_name(CREDS_PATH.name + ".tmp")
-            tmp.write_text(json.dumps(creds, indent=2), encoding="utf-8")
-            os.replace(tmp, CREDS_PATH)
-        except Exception:
-            pass  # token still usable in-memory even if write fails
-        return access, expires_at
+        new = {
+            "accessToken": access,
+            "refreshToken": data.get("refresh_token", rtok),  # rotation-safe
+            "expiresAt": int(now_ms) + int(data.get("expires_in", 28800)) * 1000,
+        }
+        # From here the grant we POSTed is dead: `new` is the only live one.
+        # Atomic write (a crash mid-write must never corrupt the file shared
+        # with Claude Code), and if it still fails, keep `new` in memory.
+        if creds is not None and _write_creds_atomic(_merge_oauth(creds, new)):
+            _set_pending(None)
+            _auth_log("token refreshed and saved")
+        else:
+            _set_pending(new)
+        return new["accessToken"], new["expiresAt"]
 
 
 def detect_plan_label():
@@ -7652,6 +7830,7 @@ def fetch_usage():
     retry_after_seconds is non-zero only on 429 with Retry-After header.
     """
     global _auth_fail_streak
+    _persist_pending()  # retry saving a refresh whose earlier write-back failed
     token, expires_at = read_token()
     if not token:
         # Missing/unreadable token. Could be a genuine logout OR a transient
@@ -9702,8 +9881,10 @@ if __name__ == "__main__":
         # taskbar placement preferences (pure geometry, no Win32 calls).
         _tb_selftest()
         _visibility_selftest()
+        _auth_selftest()
         sys.exit(0)
     # Exit silently if another instance already owns the singleton mutex
     # (e.g. the SessionStart hook fired while the widget was already running).
     if acquire_single_instance():
+        adopt_orphan_creds_tmp()
         Widget().run()
