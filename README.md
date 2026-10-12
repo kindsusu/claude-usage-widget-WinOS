@@ -154,12 +154,9 @@ The widget refreshes its own access token, so you normally **never** have to tou
 
 ### When you *do* need to act
 
-The only time manual action is needed is if the **refresh token itself** becomes invalid — which is rare (lasts months to a year):
+The only time manual action is needed is if the **refresh token itself** becomes invalid — it has its own expiry (`refreshTokenExpiresAt` in the credentials file), and a password change / sign-out elsewhere / security revocation also kills it.
 
-- Very long inactivity (months)
-- Password change / sign-out elsewhere / Anthropic security revocation
-
-Then the footer shows **"토큰 갱신 실패 · Claude Code에서 /login"** — just run `claude login` (or `/login` inside Claude Code) once and the widget recovers on the next poll.
+When the token server rejects it, the widget opens `claude auth login` (console + browser) **once, by itself**, and the taskbar strip and footer turn red: **"로그인 필요 · 클릭"**. Approve in the browser and the widget recovers on its own; if you closed the window, click the red strip or footer to reopen it. Network errors and 429/5xx never trigger this — they stay "토큰 갱신 중…" until the network is back.
 
 ## For AI agents (Claude Code, etc.)
 
@@ -188,7 +185,7 @@ print('logged in:', 'claudeAiOauth' in d and bool(d['claudeAiOauth'].get('access
 If any prerequisite is missing, instruct the user:
 - No Python → install from https://www.python.org/downloads/ with "Add Python to PATH" checked
 - No Claude Code → `npm install -g @anthropic-ai/claude-code`
-- Not logged in → user must run `claude login` themselves (browser OAuth, can't be automated)
+- Not logged in → user must run `claude auth login` themselves (browser OAuth, can't be automated)
 
 ### Install
 
@@ -238,7 +235,7 @@ $shortcut.Save()
 |---|---|---|
 | Widget process starts but no window visible | `widget_config.json` has off-screen `x`/`y` | Delete `widget_config.json` and relaunch |
 | Pet (image) doesn't show | Old PIL or wrong widget version | `pip install --upgrade pillow`, ensure widget.pyw is fresh from this repo |
-| Footer shows "토큰 갱신 실패" | refresh token invalid (rare) | User runs `claude login` once |
+| Strip/footer shows "로그인 필요 · 클릭" | refresh token expired or revoked | Approve in the login window that opened, or click the red text to reopen it |
 | Footer shows "API rate limited" | Too many polls in short time | Wait 5–10 min; widget auto-backs-off |
 | Title bar shows `●` instead of pet | `ImageTk.PhotoImage` called before `tk.Tk()` | Bug in older version — pull latest |
 

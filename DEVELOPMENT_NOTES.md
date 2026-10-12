@@ -32,7 +32,8 @@ anthropic-beta: oauth-2025-04-20
 - **핵심 함정 — refresh token 로테이션**: 응답에 새 refresh token이 오면 **반드시 저장**해야 함. 안 하면 다음 갱신이 `400 invalid_grant`. 커뮤니티 #1 버그.
 - **동시 쓰기 위험**: Claude Code가 자체적으로 토큰을 갱신하며 파일을 다시 씀. 갱신 시 **락 안에서 파일을 재읽기**해서 이미 갱신됐으면 그것을 사용.
 - **usage rate limit과 별개 엔드포인트** — 자동 갱신이 429에 기여하지 않음.
-- refresh token까지 만료(수개월~1년, 드묾)되면 로그인 다이얼로그를 띄워 `claude auth login`(← `claude login` 아님, 서브커맨드 정확히) 실행. 컴퓨터를 며칠 꺼놨다 켜도 refresh token만 살아있으면 자동 복구.
+- refresh token 자체에도 만료가 있음(`.credentials.json`의 `refreshTokenExpiresAt`, Claude Code가 로그인 시 기록·위젯은 갱신 시 이 값을 안 건드림). 2026-10-12 실측: 이 값(10-10 08:01)이 지난 뒤 갱신 → `400` → 재로그인 외 방법 없음. 회전이 이 만료를 연장하는지는 미확인. 컴퓨터를 며칠 꺼놨다 켜도 refresh token만 살아있으면 자동 복구.
+- **로그인 만료 처리 (v2.0.4)**: `LOGIN_REQUIRED`는 **서버가 거절한 grant**(`is_dead_grant`: 400/401/403으로 죽은 토큰 = 지금 쓸 토큰)일 때만. 네트워크·429·5xx는 몇 번이든 "토큰 갱신 중…". 거절 직후엔 5초 유예 후 디스크 재확인(동시에 Claude Code가 회전·저장 중일 수 있음). 확정되면 `claude auth login`(← `claude login` 아님)을 **만료 1건당 1회 자동 실행**, 스트립은 숫자 지우고 빨간 "로그인 필요 · 클릭", 스트립 사용량 영역·푸터 클릭으로 재실행. CLI를 못 찾을 때만 안내 다이얼로그(숨김 위젯이면 transient 없이 화면 중앙 — transient는 숨은 root 아래서 withdrawn으로 생성돼 안 보임).
 
 ---
 

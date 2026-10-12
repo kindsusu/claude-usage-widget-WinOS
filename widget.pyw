@@ -99,7 +99,7 @@ EPHEMERAL_KEYS = {"refresh_seconds"}
 # Bump this together with the git tag (the release workflow refuses a tag
 # that does not match). Users on older versions compare against the latest
 # release tag and pull the new widget.pyw automatically.
-__version__ = "2.0.3"
+__version__ = "2.0.4"
 
 # ---- Auto-update ----------------------------------------------------------
 # Release-gated: only a published GitHub Release reaches users, never a plain
@@ -6405,6 +6405,10 @@ def _tb_region_at(width, height, dpi, x, y):
     return None
 
 
+# Shown in red, numbers cleared, while a re-login is the only way out.
+_TB_LOGIN_MESSAGE = "로그인 필요 · 클릭"
+
+
 def _tb_render(rows, message, stale, width, height, dpi, light, high_contrast,
                hover=None):
     """Render the 2-row taskbar strip as straight-alpha RGBA pixels."""
@@ -6446,7 +6450,8 @@ def _tb_render(rows, message, stale, width, height, dpi, light, high_contrast,
     else:
         draw.text((sx(8), sy(23)), message,
                   font=_tb_font(int(round(11 * factor)), False, True),
-                  fill=palette["muted"], anchor="lm")
+                  fill=(palette["red"] if message == _TB_LOGIN_MESSAGE
+                        else palette["muted"]), anchor="lm")
     image = canvas.resize((width, height), Image.Resampling.LANCZOS)
 
     # Pass 2: bars and mark at final resolution, so colours stay exact.
@@ -7657,6 +7662,11 @@ def _auth_selftest():
     assert pick_effective_oauth(relogin, mine) == (relogin, False)
     # file momentarily unreadable/empty -> keep ours
     assert pick_effective_oauth({}, mine) == (mine, True)
+    # login expiry: only the grant the server rejected, as seen right now
+    assert is_dead_grant("r1", disk, None) is True
+    assert is_dead_grant(None, disk, None) is False
+    assert is_dead_grant("r1", relogin, None) is False  # re-login replaced it
+    assert is_dead_grant("r1", disk, mine) is False     # live unsaved grant
     merged = _merge_oauth({"mcpOAuth": {"x": 1},
                            "claudeAiOauth": {"scopes": ["s"], **disk}}, mine)
     assert merged["mcpOAuth"] == {"x": 1}
@@ -7690,6 +7700,26 @@ _refresh_lock = threading.Lock()
 # or revoked). Remembered so we stop POSTing a known-dead grant every poll;
 # cleared when a re-login writes a DIFFERENT refreshToken to disk.
 _dead_refresh_token = None
+_dead_since = 0.0  # time.time() of that rejection
+
+
+def is_dead_grant(dead, disk, pending):
+    """Pure. True when the refresh token we would use now is the one the
+    server rejected — a re-login is then the only way out. A network error or
+    429/5xx never sets `dead`, so it can never look like a login expiry."""
+    if not dead:
+        return False
+    oauth, _ = pick_effective_oauth(disk or {}, pending)
+    return oauth.get("refreshToken") == dead
+
+
+def login_expired():
+    """is_dead_grant against the credentials file as it is right now."""
+    try:
+        disk = _read_creds().get("claudeAiOauth") or {}
+    except Exception:
+        disk = {}
+    return is_dead_grant(_dead_refresh_token, disk, _pending_oauth)
 # Epoch-ms before which we must NOT POST the token endpoint again. Set when a
 # refresh returns 429/5xx (transient) so we back off instead of re-POSTing
 # every 180s poll — which would itself keep the token endpoint rate-limited.
@@ -7707,7 +7737,7 @@ def refresh_token():
     Code itself just rotated. If the save fails, the new set is kept as the
     pending set (see _pending_oauth) so the rotated grant is never lost.
     """
-    global _dead_refresh_token, _refresh_backoff_until, _last_net_log
+    global _dead_refresh_token, _dead_since, _refresh_backoff_until, _last_net_log
     with _refresh_lock:
         try:
             creds = _read_creds()
@@ -7758,6 +7788,7 @@ def refresh_token():
         except urllib.error.HTTPError as e:
             if e.code in (400, 401, 403):
                 _dead_refresh_token = rtok  # permanent: invalid/rotated grant
+                _dead_since = time.time()
                 _auth_log(f"refresh rejected: HTTP {e.code} — grant is dead; "
                           "waiting for a re-login (claude auth login)")
             elif e.code == 429 or e.code >= 500:
@@ -7851,8 +7882,14 @@ def fetch_usage():
             if new_token:
                 token = new_token
             else:
-                _auth_fail_streak += 1
-                if _auth_fail_streak >= AUTH_FAIL_THRESHOLD:
+                # Only a server-rejected grant means "log in again"; network
+                # trouble and 429/5xx stay "토큰 갱신 중…" however long they
+                # last. A rejection seconds old gets a short grace first: a
+                # concurrent Claude Code refresh may have rotated the grant
+                # and still be writing the new one to disk.
+                if _dead_refresh_token and time.time() - _dead_since < 5:
+                    time.sleep(5)
+                if login_expired():
                     return None, "LOGIN_REQUIRED", 0
                 return None, "토큰 갱신 중…", 0
     req = urllib.request.Request(
@@ -8492,6 +8529,7 @@ class Widget:
         self.tray_icon = None
         self._login_dialog = None
         self._login_poll_attempts = 0
+        self._auto_login_done = False
         self.minimized = self.desktop_mode == "mini"
         self._mini_pcts = (0.0, 0.0, 0.0)
         self._last_error = None
@@ -8716,6 +8754,8 @@ class Widget:
         self.footer_lbl = tk.Label(self.outer, text="loading…",
                                      font=("Segoe UI", 7), anchor="w")
         self.footer_lbl.pack(fill="x", pady=(5, 0))
+        self.footer_lbl.bind("<Button-1>", lambda e: (
+            self._start_login() if self._last_error == "LOGIN_REQUIRED" else None))
 
         # Minimized "battery" strip — built now, packed only in mini mode.
         s = self._ui_scale
@@ -9412,8 +9452,19 @@ class Widget:
             self._last_error = err or "데이터 없음"
             if err == "LOGIN_REQUIRED":
                 self._consec_429 = 0
-                self.footer_lbl.config(text="로그인 필요 · 클릭", fg=self.theme["danger"])
-                self._prompt_login()
+                self.footer_lbl.config(text=_TB_LOGIN_MESSAGE, fg=self.theme["danger"])
+                # Old numbers would hide the problem: clear them, show red.
+                self._taskbar_rows = ()
+                self._taskbar_update(message=_TB_LOGIN_MESSAGE, stale=True)
+                if hasattr(self, "_taskbar_details"):
+                    self._taskbar_details.update(
+                        getattr(self, "_last_data", None), _TB_LOGIN_MESSAGE,
+                        self.theme_name)
+                # Open the login once per expiry; after that the red strip /
+                # footer click reopens it, so a closed window never nags.
+                if not self._auto_login_done:
+                    self._auto_login_done = True
+                    self._start_login()
                 return
             if err and ("429" in err or "rate limited" in err.lower()):
                 self._consec_429 += 1
@@ -9435,6 +9486,7 @@ class Widget:
                     self.theme_name)
             return
         # Success path — cancel any pending unlock-refresh, nothing to retry.
+        self._auto_login_done = False
         self._cancel_unlock_refresh()
         self._consec_429 = 0
         self._last_error = None
@@ -9532,7 +9584,11 @@ class Widget:
                 pass
         t = self.theme
         dlg = tk.Toplevel(self.root)
-        dlg.transient(self.root)  # no separate taskbar button
+        # A transient of a hidden root is created withdrawn and never shows
+        # (taskbar-strip-only use), so only tie it to a visible widget.
+        shown = bool(self.root.winfo_viewable())
+        if shown:
+            dlg.transient(self.root)  # no separate taskbar button
         self._login_dialog = dlg
         dlg.title("Claude 로그인")
         dlg.configure(bg=t["bg"])
@@ -9578,9 +9634,23 @@ class Widget:
 
         # Center over the widget
         dlg.update_idletasks()
-        wx = self.root.winfo_x() + self.root.winfo_width() // 2 - dlg.winfo_width() // 2
-        wy = self.root.winfo_y() + 40
+        if shown:
+            wx = self.root.winfo_x() + self.root.winfo_width() // 2 - dlg.winfo_width() // 2
+            wy = self.root.winfo_y() + 40
+        else:  # centre of the primary screen
+            wx = (dlg.winfo_screenwidth() - dlg.winfo_width()) // 2
+            wy = (dlg.winfo_screenheight() - dlg.winfo_height()) // 3
         dlg.geometry(f"+{max(0, wx)}+{max(0, wy)}")
+
+    def _start_login(self):
+        """Open `claude auth login` (console + browser) straight away; fall
+        back to the dialog only when the CLI cannot be started."""
+        if not launch_claude_login():
+            self._prompt_login()
+            return
+        self.footer_lbl.config(text="로그인 창에서 진행하세요…", fg=self.theme["dim"])
+        self._login_poll_attempts = 0
+        self._auth_retry_after_login()
 
     def _auth_retry_after_login(self):
         """After launching login, poll the credentials file for a fresh token
@@ -9666,7 +9736,10 @@ class Widget:
                 if event[0] == "visibility":
                     self._show_visibility_panel(event[1], event[2])
                 elif event[0] == "details":
-                    self._show_taskbar_details(event[1], event[2])
+                    if self._last_error == "LOGIN_REQUIRED":
+                        self._start_login()
+                    else:
+                        self._show_taskbar_details(event[1], event[2])
                 elif event[0] == "drop":
                     self._apply_taskbar_drop(event[1])
                 elif event[0] == "priority":
