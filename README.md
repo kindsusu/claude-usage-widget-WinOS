@@ -120,7 +120,7 @@ Settings live in `widget_config.json` (auto-generated next to `widget.pyw`):
 | `theme` | `light` | `light` or `dark` |
 | `alpha` | 0.95 | Window transparency (0.3–1.0) |
 | `smart_topmost` | true | Float only when Claude is active |
-| `plan_label` | `Max` | Shown in title bar |
+| `plan_label` | (empty; auto-detected) | Shown in title bar; detected from Claude credentials when empty |
 | `pet` | (random) | Key into the embedded pet sprites |
 | `x`, `y` | 100, 100 | Window position |
 | `taskbar_zone` | `left` | `left` or `right` end of the host taskbar |
@@ -165,14 +165,14 @@ If you're an AI assistant installing this on behalf of a user, follow these step
 ### Prerequisites (verify, do not auto-install)
 
 ```bash
-# 1. Windows? (this widget is Windows-only — Win32 APIs)
-ver   # should show "Microsoft Windows"
+# 1. Windows? (run this section in Git Bash)
+cmd.exe //c ver
 
 # 2. Python 3.8+
 python --version
 
-# 2b. Required Python packages
-pip install pillow pystray comtypes
+# 2b. Check required Python packages without installing anything
+python -c "import importlib.util; names=('PIL','pystray','comtypes'); missing=[n for n in names if importlib.util.find_spec(n) is None]; print('missing:', ', '.join(missing) if missing else 'none')"
 
 # 3. Claude Code installed and logged in
 test -f "$USERPROFILE/.claude/.credentials.json" && python -c "
@@ -191,10 +191,10 @@ If any prerequisite is missing, instruct the user:
 
 ```bash
 # Pick a stable install location — user's home or Desktop
-INSTALL_DIR="$HOME/claude-usage-widget"
+INSTALL_DIR="$HOME/claude-usage-widget-WinOS"
 
 # Clone
-git clone https://github.com/kindsusu/claude-usage-widget.git "$INSTALL_DIR"
+git clone https://github.com/kindsusu/claude-usage-widget-WinOS.git "$INSTALL_DIR"
 
 # Install Python deps
 pip install pillow pystray comtypes
@@ -220,7 +220,7 @@ If `pythonw` is not in PATH, use the full path: `C:/Users/<user>/AppData/Local/P
 ```powershell
 $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Claude Usage Widget.lnk"
 $pythonw = (Get-Command pythonw).Source
-$widget = "$env:USERPROFILE\claude-usage-widget\widget.pyw"
+$widget = "$env:USERPROFILE\claude-usage-widget-WinOS\widget.pyw"
 $sh = New-Object -ComObject WScript.Shell
 $shortcut = $sh.CreateShortcut($lnk)
 $shortcut.TargetPath = $pythonw
