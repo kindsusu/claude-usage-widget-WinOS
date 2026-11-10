@@ -99,7 +99,7 @@ EPHEMERAL_KEYS = {"refresh_seconds"}
 # Bump this together with the git tag (the release workflow refuses a tag
 # that does not match). Users on older versions compare against the latest
 # release tag and pull the new widget.pyw automatically.
-__version__ = "2.0.5"
+__version__ = "2.0.6"
 
 # ---- Auto-update ----------------------------------------------------------
 # Release-gated: only a published GitHub Release reaches users, never a plain
@@ -8514,8 +8514,49 @@ class ClaudeVisibilityPanel:
             hide_from_taskbar(window.winfo_id())
 
 
+# ---- Desktop fallback (SHARED STRIP CONTRACT — mirrors codex
+# visibility_policy.resolve_visibility) ------------------------------------
+# A hidden desktop window is only safe while another surface can bring the
+# widget back. Without this, an undock that destroyed the strip left the
+# widget running with nothing on screen (2026-11-10). The fallback shows the
+# desktop TEMPORARILY: desktop_mode and every saved setting stay untouched,
+# and the window withdraws again as soon as the strip is back.
+_FALLBACK_TASKBAR = "taskbar_unavailable"
+_FALLBACK_NO_RESTORE = "no_restore_path"
+_FALLBACK_STATUS = {
+    _FALLBACK_TASKBAR: "작업표시줄 연결 대기 중",
+    _FALLBACK_NO_RESTORE: "트레이 복구를 위해 데스크톱 표시 중",
+}
+# The strip needs a moment to attach at launch and after a revive; only a
+# strip still missing after this long counts as unavailable, so a hidden
+# desktop never flashes on a normal start, a drag swap or a quick revive.
+_DESKTOP_FALLBACK_GRACE_S = 8.0
+
+
+def resolve_desktop_fallback(desktop_hidden, taskbar_requested,
+                             taskbar_attached, tray_available):
+    """Pure. Why the desktop must show despite being hidden, or None.
+
+    Same three rules as the Codex widget: a visible desktop needs no help; a
+    requested strip that is not attached leaves nothing on screen; with the
+    strip switched off, the tray is the only way back — no tray, no hiding."""
+    if not desktop_hidden:
+        return None
+    if taskbar_requested and not taskbar_attached:
+        return _FALLBACK_TASKBAR
+    if not taskbar_requested and not tray_available:
+        return _FALLBACK_NO_RESTORE
+    return None
+
+
 def _visibility_selftest():
     """Pin the panel's state labels, geometry and renderer contract."""
+    # Desktop fallback rules (shared with the Codex widget).
+    assert resolve_desktop_fallback(False, True, False, False) is None
+    assert resolve_desktop_fallback(True, True, True, False) is None
+    assert resolve_desktop_fallback(True, True, False, True) == _FALLBACK_TASKBAR
+    assert resolve_desktop_fallback(True, False, False, False) == _FALLBACK_NO_RESTORE
+    assert resolve_desktop_fallback(True, False, False, True) is None
     assert _visibility_note("normal", True) == "일반 위젯 · 작업표시줄 표시"
     assert _visibility_note("mini", False) == "미니 위젯 · 작업표시줄 숨김"
     assert _visibility_note("hidden", True) == "바탕화면 숨김 · 작업표시줄 표시"
@@ -8570,6 +8611,8 @@ class Widget:
         self._last_error = None
         self.taskbar = None
         self._taskbar_events = queue.Queue()
+        self._desktop_fallback = None     # active fallback reason, or None
+        self._fallback_since = None       # monotonic time the reason appeared
 
         self.root = tk.Tk()
 
@@ -8650,6 +8693,9 @@ class Widget:
 
         self._setup_tray()
         self._setup_taskbar()
+        # Runs whether or not the strip came up: a strip that never started
+        # is exactly the case the fallback exists for.
+        self.root.after(500, self._desktop_guard)
 
         self.refresh()
         self._schedule_refresh()
@@ -9814,6 +9860,66 @@ class Widget:
                  f"retrying every {_TB_REVIVE_SECONDS:.0f} s", "taskbar")
             self._taskbar_dead_logged = True
 
+    def _desktop_guard(self):
+        """Every 0.5 s: keep at least one way back to the widget on screen."""
+        try:
+            self._apply_desktop_fallback()
+            self._refresh_tray_status()
+        except Exception:
+            pass
+        self.root.after(500, self._desktop_guard)
+
+    def _apply_desktop_fallback(self):
+        """Show the hidden desktop while no other surface can restore it, and
+        withdraw it again once one can. Never touches desktop_mode or cfg."""
+        surface = self.taskbar
+        reason = resolve_desktop_fallback(
+            self.desktop_mode == "hidden",
+            bool(self.cfg.get("taskbar_visible", True)),
+            bool(surface is not None and surface.attached),
+            self.tray_icon is not None)
+        if reason is None:
+            self._fallback_since = None
+            if self._desktop_fallback is not None:
+                self._desktop_fallback = None
+                if self.desktop_mode == "hidden":
+                    # Same deterministic layout _set_desktop_mode leaves behind.
+                    self._apply_desktop_layout(False)
+                    self.root.withdraw()
+                    self._visible = False
+                    _log("taskbar strip is back; desktop hidden again", "taskbar")
+            return
+        now = time.monotonic()
+        if self._desktop_fallback is not None:
+            # Already showing. Re-show only if the user hid the desktop again
+            # while it is still the sole surface — the net wins, as in Codex.
+            self._desktop_fallback = reason
+            if self.root.state() == "withdrawn":
+                self._show_desktop_fallback()
+            return
+        if self._fallback_since is None:
+            self._fallback_since = now
+        grace = _DESKTOP_FALLBACK_GRACE_S if reason == _FALLBACK_TASKBAR else 0.0
+        if now - self._fallback_since < grace:
+            return
+        self._desktop_fallback = reason
+        self._show_desktop_fallback()
+        _log(f"desktop is hidden but {_FALLBACK_STATUS[reason]}; "
+             "showing the desktop until the strip is back "
+             "(saved settings unchanged)", "taskbar")
+
+    def _show_desktop_fallback(self):
+        """Bring the desktop up in its last real mode without saving a mode."""
+        mode = self.cfg.get("desktop_restore_mode", "normal")
+        self._apply_desktop_layout(mode == "mini")
+        self.root.deiconify()
+        self._visible = True
+        self.root.attributes("-topmost", True)
+        set_window_zorder(self._hwnd(), "top")
+        self._current_z = "top"
+        hide_from_taskbar(self._hwnd())
+        self.root.after(50, self._clamp_to_screen)
+
     def _refresh_tray_status(self):
         """Keep the tray tooltip in step with the host fallback state."""
         status = self._taskbar_host_status()
@@ -9868,6 +9974,9 @@ class Widget:
         """Tray tooltip suffix while the chosen taskbar is unavailable.
 
         SHARED STRIP CONTRACT — same wording as the Codex widget's tray."""
+        reason = getattr(self, "_desktop_fallback", None)
+        if reason is not None:
+            return _FALLBACK_STATUS[reason]
         surface = self.taskbar
         if surface is not None and surface.host_fallback:
             return "선택한 작업표시줄 없음 · 주 작업표시줄 사용 중"
