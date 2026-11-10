@@ -1,0 +1,152 @@
+/* 꼬리 흔들기 */
+.pixel-cat .tail,
+.pixel-dog .tail,
+.pixel-fox .tail,
+.pixel-devil .tail,
+.pixel-dino .tail,
+.pixel-dragon .tail {
+  animation: tail-wag 0.8s steps(2, end) infinite;
+  transform-origin: 120px 100px;
+}
+@keyframes tail-wag {
+  0%, 100% { transform: translateX(0); }
+  50%      { transform: translateX(6px); }
+}
+
+/* 귀 까딱 */
+.pixel-cat .ears,
+.pixel-rabbit .ears,
+.pixel-unicorn .ears {
+  animation: ear-wiggle 1.5s steps(2, end) infinite;
+  transform-origin: 80px 60px;
+}
+@keyframes ear-wiggle {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-3px); }
+}
+
+/* 날개 파닥 */
+.pixel-bat .wings,
+.pixel-dragon .wings {
+  animation: wing-flap 0.7s steps(2, end) infinite;
+  transform-origin: 80px 90px;
+}
+@keyframes wing-flap {
+  0%, 100% { transform: scaleY(1); }
+  50%      { transform: scaleY(0.85); }
+}
+
+/* 눈 깜빡임 */
+.pixel-bear .eyes,
+.pixel-penguin .eyes,
+.pixel-chick .eyes,
+.pixel-panda .eyes,
+.pixel-frog .eyes {
+  animation: blink 4s steps(1, end) infinite;
+  transform-origin: center;
+}
+@keyframes blink {
+  0%, 96%, 100% { transform: scaleY(1); }
+  98%           { transform: scaleY(0.1); }
+}
+
+/* 전체 통통 (몸 전체 bounce) */
+.pixel-cat, .pixel-dog, .pixel-unicorn, .pixel-dragon,
+.pixel-dino, .pixel-monster, .pixel-chick {
+  animation: body-bounce 1.2s ease-in-out infinite;
+  transform-origin: center bottom;
+}
+@keyframes body-bounce {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-4px); }
+}
+
+/* 좌우 뒤뚱 */
+.pixel-penguin, .pixel-devil, .pixel-panda {
+  animation: body-sway 2s ease-in-out infinite;
+  transform-origin: center bottom;
+}
+@keyframes body-sway {
+  0%, 100% { transform: rotate(0deg); }
+  25%      { transform: rotate(3deg); }
+  75%      { transform: rotate(-3deg); }
+}
+
+/* 둥둥 떠다님 */
+.pixel-ghost, .pixel-bat, .pixel-alien {
+  animation: float 3s ease-in-out infinite;
+}
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-6px); }
+}
+
+/* 슬라임 / 개구리 / 돼지 squish */
+.pixel-slime, .pixel-frog, .pixel-pig {
+  animation: squish 1.5s ease-in-out infinite;
+  transform-origin: center bottom;
+}
+@keyframes squish {
+  0%, 100% { transform: scaleY(1) scaleX(1); }
+  50%      { transform: scaleY(0.85) scaleX(1.1); }
+}
+
+/* 로봇 딱딱한 틱 */
+.pixel-robot {
+  animation: tick 0.6s steps(2, end) infinite;
+}
+@keyframes tick {
+  0%, 50% { transform: translateX(0); }
+  51%, 100% { transform: translateX(1px); }
+}
+
+/* 안테나 흔들기 (로봇/외계인) */
+.pixel-robot .antenna,
+.pixel-alien .antenna {
+  animation: antenna-wiggle 1.2s steps(2, end) infinite;
+  transform-origin: 100px 56px;
+}
+@keyframes antenna-wiggle {
+  0%, 100% { transform: rotate(0deg); }
+  50%      { transform: rotate(6deg); }
+}
+
+/* 유니콘 뿔 반짝임 */
+.pixel-unicorn .horn {
+  animation: horn-shine 2s ease-in-out infinite;
+  transform-origin: 100px 48px;
+}
+@keyframes horn-shine {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.7; }
+}
+
+/* 유니콘 갈기 잔물결 */
+.pixel-unicorn .mane {
+  animation: mane-wave 2s ease-in-out infinite;
+  transform-origin: 100px 70px;
+}
+@keyframes mane-wave {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-2px); }
+}
+
+/* 괴물 입 열고 닫기 */
+.pixel-monster .mouth {
+  animation: mouth-open 1.4s steps(2, end) infinite;
+  transform-origin: 100px 104px;
+}
+@keyframes mouth-open {
+  0%, 100% { transform: scaleY(1); }
+  50%      { transform: scaleY(1.25); }
+}
+
+/* 돼지 코 씰룩 */
+.pixel-pig .nose {
+  animation: nose-twitch 1.6s steps(2, end) infinite;
+  transform-origin: 100px 96px;
+}
+@keyframes nose-twitch {
+  0%, 80%, 100% { transform: translateY(0); }
+  90%           { transform: translateY(-1px); }
+}

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" shape-rendering="crispEdges" class="pixel-slime">
+  <g class="body">
+    <rect x="100" y="20" width="10" height="10" fill="#29b6f6"/>
+    <rect x="100" y="30" width="20" height="10" fill="#29b6f6"/>
+    <rect x="90" y="40" width="30" height="10" fill="#29b6f6"/>
+    <rect x="80" y="50" width="50" height="10" fill="#29b6f6"/>
+    <rect x="70" y="60" width="70" height="10" fill="#29b6f6"/>
+    <rect x="60" y="70" width="90" height="10" fill="#29b6f6"/>
+    <rect x="50" y="80" width="110" height="10" fill="#29b6f6"/>
+    <rect x="40" y="90" width="130" height="10" fill="#29b6f6"/>
+    <rect x="30" y="100" width="150" height="10" fill="#29b6f6"/>
+    <rect x="30" y="110" width="150" height="10" fill="#29b6f6"/>
+    <rect x="30" y="120" width="150" height="10" fill="#29b6f6"/>
+    <rect x="30" y="130" width="150" height="10" fill="#29b6f6"/>
+    <rect x="30" y="140" width="150" height="10" fill="#29b6f6"/>
+    <rect x="30" y="150" width="150" height="10" fill="#29b6f6"/>
+    <rect x="30" y="160" width="150" height="10" fill="#29b6f6"/>
+  </g>
+  <g class="highlights">
+    <rect x="80" y="60" width="10" height="10" fill="#b3e5fc"/>
+    <rect x="70" y="70" width="20" height="10" fill="#b3e5fc"/>
+    <rect x="60" y="80" width="20" height="10" fill="#b3e5fc"/>
+  </g>
+  <g class="eyes">
+    <rect x="70" y="110" width="10" height="20" fill="#1a1a1a"/>
+    <rect x="120" y="110" width="10" height="20" fill="#1a1a1a"/>
+  </g>
+  <g class="cheeks">
+    <rect x="50" y="120" width="10" height="10" fill="#ffc0cb"/>
+    <rect x="140" y="120" width="10" height="10" fill="#ffc0cb"/>
+  </g>
+  <g class="mouth">
+    <rect x="80" y="120" width="40" height="10" fill="#1a1a1a"/>
+    <rect x="80" y="130" width="40" height="10" fill="#1a1a1a"/>
+    <rect x="90" y="120" width="20" height="10" fill="#29b6f6"/>
+  </g>
+</svg>
