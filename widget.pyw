@@ -99,7 +99,7 @@ EPHEMERAL_KEYS = {"refresh_seconds"}
 # Bump this together with the git tag (the release workflow refuses a tag
 # that does not match). Users on older versions compare against the latest
 # release tag and pull the new widget.pyw automatically.
-__version__ = "2.0.4"
+__version__ = "2.0.5"
 
 # ---- Auto-update ----------------------------------------------------------
 # Release-gated: only a published GitHub Release reaches users, never a plain
@@ -5294,6 +5294,9 @@ _TB_TME_LEAVE = 0x2
 _TB_HOVER_FILL = (127, 127, 127, 80)
 _TB_UIA_BUTTON = 50000
 _TB_POLL_MS = 1500
+# Seconds between attempts to recreate a strip whose window was destroyed
+# together with its host taskbar (monitor unplugged, Explorer restarted).
+_TB_REVIVE_SECONDS = 3.0
 _TB_COINIT_MULTITHREADED = 0
 _TB_RPC_E_CHANGED_MODE = -2147417850
 
@@ -6797,6 +6800,38 @@ class TaskbarSurface:
             self._thread.start()
         self._ready.wait(1.0)
         return self.available
+
+    def revive(self):
+        """Recreate the strip after its window died with its host taskbar.
+
+        The strip is a CHILD of the taskbar window, which lives in Explorer.
+        Unplugging the monitor of a secondary taskbar (or an Explorer restart)
+        destroys that taskbar and every child with it: WM_DESTROY ends the
+        message loop and this surface goes unavailable for good, because
+        start() used to run only once at launch. The host fallback in
+        _tb_choose_host only helps a LIVE strip that rescans, so without this
+        the widget could end up with no visible surface at all (2026-11-10).
+
+        Per-run state is reset so the new window starts like a fresh launch;
+        placement, rows and visibility are kept, so the strip comes back where
+        the settings say — on the primary bar while the saved one is missing."""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return True
+            self._target = None
+            self._attached = False
+            self._hover = None
+            self._press = self._press_rect = None
+            self._dragging = False
+            self._swap_pending = False
+            self._swap_sibling_ready = False
+            self._swap_source = self._swap_target = None
+            self._swap_parent = 0
+            self._swap_bounds = None
+            self._was_at_edge = False
+            self._claim_scans = 0
+            self._started_at = time.monotonic()
+        return self.start()
 
     def update(self, rows, message, stale):
         with self._lock:
@@ -9748,8 +9783,36 @@ class Widget:
                     self._popup_menu(event[1], event[2])
             except Exception:
                 pass
+        self._revive_taskbar_if_dead()
         self._refresh_tray_status()
         self.root.after(120, self._taskbar_pump)
+
+    def _revive_taskbar_if_dead(self):
+        """Bring the strip back when its window was destroyed under it.
+
+        See TaskbarSurface.revive(). Throttled so a host that keeps refusing
+        the strip costs one attempt every few seconds, not every pump tick.
+        Logged, because "the widget vanished" is otherwise unexplainable."""
+        surface = self.taskbar
+        if surface is None or surface.available:
+            self._taskbar_dead_logged = False
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_taskbar_revive_at", 0.0):
+            return
+        self._taskbar_revive_at = now + _TB_REVIVE_SECONDS
+        try:
+            revived = surface.revive()
+        except Exception:
+            revived = False
+        if revived:
+            _log("taskbar strip window was destroyed (its taskbar went away); "
+                 "recreated", "taskbar")
+            self._taskbar_dead_logged = False
+        elif not getattr(self, "_taskbar_dead_logged", False):
+            _log("taskbar strip window is gone and could not be recreated yet; "
+                 f"retrying every {_TB_REVIVE_SECONDS:.0f} s", "taskbar")
+            self._taskbar_dead_logged = True
 
     def _refresh_tray_status(self):
         """Keep the tray tooltip in step with the host fallback state."""
