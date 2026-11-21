@@ -99,7 +99,7 @@ EPHEMERAL_KEYS = {"refresh_seconds"}
 # Bump this together with the git tag (the release workflow refuses a tag
 # that does not match). Users on older versions compare against the latest
 # release tag and pull the new widget.pyw automatically.
-__version__ = "2.0.6"
+__version__ = "2.0.7"
 
 # ---- Auto-update ----------------------------------------------------------
 # Release-gated: only a published GitHub Release reaches users, never a plain
@@ -7869,26 +7869,163 @@ def refresh_token():
         return new["accessToken"], new["expiresAt"]
 
 
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+# How often to re-ask the server which plan this account is on. A plan change
+# (upgrade/downgrade) is rare; the local credentials file only records the plan
+# at LOGIN time, so without this the widget kept showing "Max(5x)" after an
+# upgrade to Ultra (2026-11-21).
+PLAN_REFRESH_SECONDS = 6 * 3600
+
+
+def plan_label_from(org=None, oauth=None):
+    """Pure. Display label for the plan, preferring the server's own name.
+
+    org   — `organization` from GET /api/oauth/profile (may be None)
+    oauth — `claudeAiOauth` from .credentials.json (may be None; stale after
+            a plan change because it is only written at login)
+
+    The server's plan_display_name ("Pro", "Max", "Ultra", …) is used as-is;
+    "Max" keeps its usage multiplier from the rate-limit tier ("Max(5x)").
+    Ultra reports a max_20x tier but must read "Ultra", so the tier is only a
+    suffix for Max and a fallback when the server name is unavailable."""
+    org = org or {}
+    oauth = oauth or {}
+    tier = (org.get("rate_limit_tier") or oauth.get("rateLimitTier") or "").lower()
+    mult = "(20x)" if "max_20x" in tier else "(5x)" if "max_5x" in tier else ""
+    name = (org.get("plan_display_name") or "").strip()
+    if name:
+        return f"{name}{mult}" if name.lower() == "max" else name
+    sub = (oauth.get("subscriptionType") or "").lower()
+    if "max_20x" in tier:
+        return "Max(20x)"
+    if "max_5x" in tier:
+        return "Max(5x)"
+    if "pro" in tier or sub == "pro":
+        return "Pro"
+    if sub == "max":
+        return "Max"
+    if sub:
+        return sub.title()
+    return "Max"
+
+
 def detect_plan_label():
-    """Read subscription tier from local credentials, return display label."""
+    """Label from local credentials only (no network). Used until the server
+    has answered once; may be stale after a plan change."""
     try:
         d = json.loads(CREDS_PATH.read_text(encoding="utf-8"))
-        oauth = d.get("claudeAiOauth", {})
-        tier = (oauth.get("rateLimitTier") or "").lower()
-        sub = (oauth.get("subscriptionType") or "").lower()
-        if "max_20x" in tier:
-            return "Max(20x)"
-        if "max_5x" in tier:
-            return "Max(5x)"
-        if "pro" in tier or sub == "pro":
-            return "Pro"
-        if sub == "max":
-            return "Max"
-        if sub:
-            return sub.title()
+        return plan_label_from(None, d.get("claudeAiOauth", {}))
     except Exception:
-        pass
-    return "Max"
+        return "Max"
+
+
+def fetch_plan_label():
+    """Ask the server for the current plan. Returns a label or None.
+    Never refreshes the token itself (fetch_usage owns that) and never raises."""
+    token, expires_at = read_token()
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    if not token or (expires_at and expires_at <= now_ms):
+        return None
+    req = urllib.request.Request(PROFILE_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "Accept": "application/json",
+        "User-Agent": f"claude-usage-widget/{__version__}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            org = (json.loads(r.read().decode("utf-8")) or {}).get("organization")
+    except Exception:
+        return None
+    if not org:
+        return None
+    try:
+        oauth = json.loads(CREDS_PATH.read_text(encoding="utf-8")).get("claudeAiOauth", {})
+    except Exception:
+        oauth = {}
+    return plan_label_from(org, oauth)
+
+
+def usage_rows(data):
+    """Pure. The limits the server actually reports, in display order:
+    [(key, label, used_pct, resets_at_datetime_or_None)], key ∈
+    {"session", "weekly", "scoped"}.
+
+    Plans differ in which limits exist — Ultra has no 5-hour session limit
+    (five_hour is null), a plan may have no model-scoped weekly limit — so
+    every surface draws only these rows instead of a fixed three, which used
+    to show a phantom "현재 세션 0% 사용됨" on Ultra."""
+    if not data:
+        return []
+    rows = []
+    limits = data.get("limits") or []
+
+    def pct(v):
+        try:
+            return max(0.0, min(100.0, float(v or 0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    five = data.get("five_hour")
+    if isinstance(five, dict):
+        rows.append(("session", "현재 세션", pct(five.get("utilization")),
+                     parse_iso(five.get("resets_at"))))
+    weekly = data.get("seven_day")
+    if isinstance(weekly, dict):
+        rows.append(("weekly", "주간 한도", pct(weekly.get("utilization")),
+                     parse_iso(weekly.get("resets_at"))))
+    else:
+        for lim in limits:
+            if lim.get("kind") == "weekly_all":
+                rows.append(("weekly", "주간 한도", pct(lim.get("percent")),
+                             parse_iso(lim.get("resets_at"))))
+                break
+    # Model-scoped weekly limit: the generic `limits` entry names the model
+    # (e.g. "Fable"); the legacy seven_day_sonnet field is the fallback.
+    for lim in limits:
+        if lim.get("kind") == "weekly_scoped":
+            model = ((lim.get("scope") or {}).get("model") or {})
+            rows.append(("scoped", f"{model.get('display_name') or 'Sonnet'} 주간",
+                         pct(lim.get("percent")), parse_iso(lim.get("resets_at"))))
+            break
+    else:
+        sonnet = data.get("seven_day_sonnet")
+        if isinstance(sonnet, dict):
+            rows.append(("scoped", "Sonnet 주간", pct(sonnet.get("utilization")),
+                         parse_iso(sonnet.get("resets_at"))))
+    return rows
+
+
+def _plan_selftest():
+    """Pin plan labels and per-plan row sets. Run by --selftest (pure)."""
+    ultra = {"plan_display_name": "Ultra", "rate_limit_tier": "default_claude_max_20x"}
+    stale = {"rateLimitTier": "default_claude_max_5x", "subscriptionType": "max"}
+    assert plan_label_from(ultra, stale) == "Ultra"
+    assert plan_label_from({"plan_display_name": "Max",
+                            "rate_limit_tier": "default_claude_max_5x"}) == "Max(5x)"
+    assert plan_label_from({"plan_display_name": "Max",
+                            "rate_limit_tier": "default_claude_max_20x"}) == "Max(20x)"
+    assert plan_label_from({"plan_display_name": "Pro",
+                            "rate_limit_tier": "default_claude_pro"}) == "Pro"
+    assert plan_label_from(None, stale) == "Max(5x)"          # offline fallback
+    assert plan_label_from(None, {"subscriptionType": "pro"}) == "Pro"
+    assert plan_label_from(None, None) == "Max"
+    # Ultra: no five_hour -> no session row; scoped row from `limits`.
+    ultra_usage = {
+        "five_hour": None, "seven_day": {"utilization": 6.0, "resets_at": None},
+        "limits": [{"kind": "weekly_all", "percent": 6},
+                   {"kind": "weekly_scoped", "percent": 4,
+                    "scope": {"model": {"display_name": "Fable"}}}],
+    }
+    assert [(k, l, p) for k, l, p, _ in usage_rows(ultra_usage)] == [
+        ("weekly", "주간 한도", 6.0), ("scoped", "Fable 주간", 4.0)]
+    # Max/Pro shape: session + weekly, no scoped limit at all.
+    two = {"five_hour": {"utilization": 30}, "seven_day": {"utilization": 10}}
+    assert [k for k, *_ in usage_rows(two)] == ["session", "weekly"]
+    # weekly only from `limits` when seven_day is absent.
+    assert [(k, p) for k, _l, p, _r in usage_rows(
+        {"limits": [{"kind": "weekly_all", "percent": 12}]})] == [("weekly", 12.0)]
+    assert usage_rows(None) == []
 
 
 def fetch_usage():
@@ -8014,34 +8151,11 @@ _DETAIL_WIDTH = 292
 
 
 def _taskbar_detail_rows(data):
-    """Build the same usage/reset rows shown on the desktop card."""
-    if not data:
-        return ()
-    five = data.get("five_hour") or {}
-    weekly = data.get("seven_day") or {}
-    scoped = data.get("seven_day_sonnet") or {}
-    scoped_label = "Sonnet 주간"
-    scoped_pct = scoped.get("utilization", 0) or 0
-    scoped_reset = parse_iso(scoped.get("resets_at"))
-    for limit in data.get("limits") or ():
-        if limit.get("kind") == "weekly_scoped":
-            model = ((limit.get("scope") or {}).get("model") or {})
-            scoped_label = f"{model.get('display_name') or 'Sonnet'} 주간"
-            scoped_pct = limit.get("percent", 0) or 0
-            scoped_reset = parse_iso(limit.get("resets_at"))
-            break
-
-    def row(label, source, percent=None, reset=None):
-        used = source.get("utilization", 0) if percent is None else percent
-        reset_at = parse_iso(source.get("resets_at")) if reset is None else reset
-        reset_text = f"{fmt_reset_local(reset_at)} 리셋" if reset_at else ""
-        return label, max(0.0, min(100.0, float(used or 0))), reset_text
-
-    return (
-        row("현재 세션", five),
-        row("주간 한도", weekly),
-        row(scoped_label, scoped, scoped_pct, scoped_reset),
-    )
+    """Build the same usage/reset rows shown on the desktop card — only the
+    limits this plan actually has (see usage_rows)."""
+    return tuple(
+        (label, used, f"{fmt_reset_local(reset)} 리셋" if reset else "")
+        for _key, label, used, reset in usage_rows(data))
 
 
 class ClaudeTaskbarDetails:
@@ -8607,7 +8721,10 @@ class Widget:
         self._login_poll_attempts = 0
         self._auto_login_done = False
         self.minimized = self.desktop_mode == "mini"
-        self._mini_pcts = (0.0, 0.0, 0.0)
+        # [(row key, used %)] — only the limits this plan has (usage_rows).
+        self._mini_pcts = [("session", 0.0), ("weekly", 0.0), ("scoped", 0.0)]
+        self._server_plan = (self.cfg.get("detected_plan") or "").strip() or None
+        self._plan_checked_at = 0.0
         self._last_error = None
         self.taskbar = None
         self._taskbar_events = queue.Queue()
@@ -8763,7 +8880,7 @@ class Widget:
         # Title first (leftmost), then pet to its right
         self.title_lbl = tk.Label(
             title_bar,
-            text=f"Claude {(self.cfg.get('plan_label') or '').strip() or detect_plan_label()}",
+            text=f"Claude {self._display_plan()}",
             font=("Segoe UI", 9, "bold"),
         )
         self.title_lbl.pack(side="left")
@@ -8899,8 +9016,16 @@ class Widget:
         t = self.theme
         # Independent mini scale over the DPI/ui scale; adjustable live.
         ms = self._ui_scale * float(self.cfg.get("mini_scale", 1.0))
+        # One battery per limit the plan actually has (e.g. Ultra: no session
+        # limit -> W and F only). Each battery slot is 74 px wide; the canvas
+        # shrinks with the count so the strip keeps its right margin.
+        items = [(k, p) for k, p in (self._mini_pcts or [])
+                 if k in ("session", "weekly", "scoped")]
+        if not items:
+            items = [("session", 0.0), ("weekly", 0.0), ("scoped", 0.0)]
+        width_raw = 230 - 74 * (3 - len(items))
         # Resize the canvas live so mini-scale changes apply without restart.
-        self.mini_canvas.config(width=int(round(230 * ms)),
+        self.mini_canvas.config(width=int(round(width_raw * ms)),
                                  height=int(round(40 * ms)))
         # The resize above can push the window's right/bottom edge past the
         # monitor even though nothing moved — re-clamp once Tk has laid the
@@ -8915,22 +9040,22 @@ class Widget:
         # No capsule/background: batteries + labels float directly over the
         # desktop (true per-pixel translucency is impossible in tkinter —
         # would require an UpdateLayeredWindow rewrite; user chose no-bg).
-        # Defensive: pad to 3 in case a stale 2-tuple lingers in state.
-        s_pct, w_pct, f_pct = (*self._mini_pcts, 0.0)[:3]
-
         # Theme-aware label colors so the floating S/W/F letters stay readable
         # on both themes (dark-mode weekly was unreadable with the old blue).
         if self.theme_name == "dark":
             session_lbl, weekly_lbl, fable_lbl = "#a6e3a1", "#89b4fa", "#cba6f7"
         else:
             session_lbl, weekly_lbl, fable_lbl = "#5aa15d", "#2563eb", "#7c3aed"
+        spec = {
+            "session": ("S", session_lbl, MINI_SESSION_FILL),
+            "weekly": ("W", weekly_lbl, MINI_WEEKLY_FILL),
+            "scoped": ("F", fable_lbl, MINI_FABLE_FILL),
+        }
 
-        # (label, label_color, base_fill, body_x, usage_pct)
-        groups = [
-            ("S", session_lbl, MINI_SESSION_FILL, 20, s_pct),
-            ("W", weekly_lbl, MINI_WEEKLY_FILL, 94, w_pct),
-            ("F", fable_lbl, MINI_FABLE_FILL, 168, f_pct),
-        ]
+        # (label, label_color, base_fill, body_x, usage_pct) — same 20/94/168
+        # slots as before, packed left so a missing limit leaves no hole.
+        groups = [(*spec[key], 20 + 74 * index, pct)
+                  for index, (key, pct) in enumerate(items)]
         for (label, lbl_color, base_fill, body_x_raw,
              pct) in groups:
             usage = max(0.0, min(100.0, float(pct or 0)))
@@ -9448,10 +9573,10 @@ class Widget:
             self._current_z = "top"
 
     def _prompt_plan(self):
-        # Empty value = revert to auto-detect from credentials
+        # Empty value = revert to auto-detect (server plan, then credentials)
         self._prompt("plan_label", "플랜 이름 (빈칸 = 자동)", str,
                      on_save=lambda v: self.title_lbl.config(
-                         text=f"Claude {(v.strip() if v else '') or detect_plan_label()}"))
+                         text=f"Claude {(v.strip() if v else '') or self._display_plan()}"))
 
     def _prompt_interval(self):
         self._prompt("refresh_seconds", "새로고침 간격 (초)", int)
@@ -9510,9 +9635,71 @@ class Widget:
             self._foreground_check_id = self.root.after(500, self._check_topmost)
 
     def _display_plan(self):
-        """Return manual override if set, else auto-detected plan."""
+        """Manual override if set, else the plan the server reported last
+        (persisted, so an offline start still shows it), else the label in
+        the local credentials file."""
         custom = (self.cfg.get("plan_label") or "").strip()
-        return custom if custom else detect_plan_label()
+        if custom:
+            return custom
+        return getattr(self, "_server_plan", None) or detect_plan_label()
+
+    def _maybe_refresh_plan(self):
+        """Re-ask the server for the plan at launch and every few hours, off
+        the Tk thread. Only touches the title when the answer changes."""
+        now = time.monotonic()
+        if self._plan_checked_at and now - self._plan_checked_at < PLAN_REFRESH_SECONDS:
+            return
+        self._plan_checked_at = now
+
+        def worker():
+            label = fetch_plan_label()
+            if label:
+                self.root.after(0, lambda: self._apply_server_plan(label))
+            else:
+                # Failed (offline, token about to rotate): try again sooner.
+                self.root.after(0, self._retry_plan_soon)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _retry_plan_soon(self):
+        self._plan_checked_at = time.monotonic() - PLAN_REFRESH_SECONDS + 600
+
+    def _apply_server_plan(self, label):
+        if label == self._server_plan:
+            return
+        previous = self._server_plan or detect_plan_label()
+        self._server_plan = label
+        self.cfg["detected_plan"] = label
+        save_config(self.cfg)
+        _log(f"plan from server: {label} (was showing {previous})", "plan")
+        plan = self._display_plan()
+        if (getattr(self, "_last_data", None) or {}).get("extra_usage", {}).get("is_enabled"):
+            plan += " +Extra"
+        self.title_lbl.config(text=f"Claude {plan}")
+
+    def _show_rows(self, keys):
+        """Pack only the desktop-card rows for limits this plan has, in the
+        fixed session/weekly/scoped order, with their original spacing."""
+        keys = tuple(k for k in ("session", "weekly", "scoped") if k in keys)
+        if not keys or keys == getattr(self, "_shown_rows", ("session", "weekly", "scoped")):
+            return
+        groups = {
+            "session": ((self.session_pct_lbl, {"fill": "x", "pady": (6, 1)}),
+                        (self.session_canvas, {}),
+                        (self.session_detail_lbl, {"fill": "x", "pady": (1, 0)})),
+            "weekly": ((self.weekly_pct_lbl, {"fill": "x", "pady": (6, 1)}),
+                       (self.weekly_canvas, {}),
+                       (self.weekly_detail_lbl, {"fill": "x", "pady": (1, 0)})),
+            "scoped": ((self.sonnet_pct_lbl, {"fill": "x", "pady": (6, 1)}),
+                       (self.sonnet_canvas, {})),
+        }
+        for widgets in groups.values():
+            for widget, _opts in widgets:
+                widget.pack_forget()
+        for key in keys:
+            for widget, opts in groups[key]:
+                widget.pack(before=self.footer_lbl, **opts)
+        self._shown_rows = keys
+        self.root.after(50, self._clamp_to_screen)
 
     def refresh(self):
         if self.fetching:
@@ -9572,40 +9759,33 @@ class Widget:
         self._consec_429 = 0
         self._last_error = None
         self._last_data = data
-        fh = data.get("five_hour") or {}
-        sd = data.get("seven_day") or {}
-        ss = data.get("seven_day_sonnet") or {}
         eu = data.get("extra_usage") or {}
-        s_pct = fh.get("utilization", 0) or 0
-        self.session_pct_lbl.config(text=f"현재 세션  {s_pct:.0f}% 사용됨")
-        self._draw_bar(self.session_canvas, s_pct)
-        s_reset = parse_iso(fh.get("resets_at"))
-        rem = fmt_remaining(s_reset)
-        reset_local = fmt_reset_local(s_reset)
-        self.session_detail_lbl.config(
-            text=f"{rem}  ({reset_local} 리셋)" if reset_local else rem
-        )
-        w_pct = sd.get("utilization", 0) or 0
-        self.weekly_pct_lbl.config(text=f"주간 한도  {w_pct:.0f}% 사용됨")
-        self._draw_bar(self.weekly_canvas, w_pct)
-        w_reset = parse_iso(sd.get("resets_at"))
-        self.weekly_detail_lbl.config(
-            text=f"{fmt_reset_local(w_reset)} 리셋" if w_reset else ""
-        )
-        # Third row: model-scoped weekly limit. The API moved from fixed
-        # per-model fields (seven_day_sonnet, now null) to a generic `limits`
-        # array whose weekly_scoped entry names the model it applies to
-        # (e.g. display_name "Fable"). Prefer that; fall back to the legacy
-        # field for older API responses.
-        ss_label, ss_pct = "Sonnet", ss.get("utilization", 0) or 0
-        for lim in (data.get("limits") or []):
-            if lim.get("kind") == "weekly_scoped":
-                model = ((lim.get("scope") or {}).get("model") or {})
-                ss_label = model.get("display_name") or ss_label
-                ss_pct = lim.get("percent", 0) or 0
-                break
-        self.sonnet_pct_lbl.config(text=f"{ss_label} 주간  {ss_pct:.0f}% 사용됨")
-        self._draw_bar(self.sonnet_canvas, ss_pct)
+        # Only the limits this plan has (Ultra: no 5-hour session limit).
+        usage = usage_rows(data)
+        rows = {key: (label, used, reset) for key, label, used, reset in usage}
+        self._show_rows(rows)
+        if "session" in rows:
+            _label, s_pct, s_reset = rows["session"]
+            self.session_pct_lbl.config(text=f"현재 세션  {s_pct:.0f}% 사용됨")
+            self._draw_bar(self.session_canvas, s_pct)
+            rem = fmt_remaining(s_reset)
+            reset_local = fmt_reset_local(s_reset)
+            self.session_detail_lbl.config(
+                text=f"{rem}  ({reset_local} 리셋)" if reset_local else rem
+            )
+        if "weekly" in rows:
+            _label, w_pct, w_reset = rows["weekly"]
+            self.weekly_pct_lbl.config(text=f"주간 한도  {w_pct:.0f}% 사용됨")
+            self._draw_bar(self.weekly_canvas, w_pct)
+            self.weekly_detail_lbl.config(
+                text=f"{fmt_reset_local(w_reset)} 리셋" if w_reset else ""
+            )
+        if "scoped" in rows:
+            # Model-scoped weekly limit, named by the server (e.g. "Fable 주간").
+            ss_label, ss_pct, _reset = rows["scoped"]
+            self.sonnet_pct_lbl.config(text=f"{ss_label}  {ss_pct:.0f}% 사용됨")
+            self._draw_bar(self.sonnet_canvas, ss_pct)
+        self._maybe_refresh_plan()
         plan = self._display_plan()
         if eu.get("is_enabled"):
             plan += " +Extra"
@@ -9614,11 +9794,11 @@ class Widget:
             text=f"업데이트 {datetime.now().strftime('%H:%M:%S')}  ·  우클릭=메뉴",
             fg=self.theme["muted"],
         )
-        # keep the battery strip in sync
-        self._mini_pcts = (s_pct, w_pct, ss_pct)
+        # keep the battery strip in sync — one battery per existing limit
+        self._mini_pcts = [(key, used) for key, _label, used, _reset in usage]
         self._draw_mini()
-        # taskbar strip shows only the 5h session and the weekly limit
-        self._taskbar_update(s_pct, w_pct)
+        # taskbar strip: the 5h session and weekly limit, whichever exist
+        self._taskbar_update(usage)
         if hasattr(self, "_taskbar_details"):
             self._taskbar_details.update(data, None, self.theme_name)
 
@@ -9935,17 +10115,23 @@ class Widget:
         except Exception:
             pass
 
-    def _taskbar_update(self, session_pct=None, weekly_pct=None,
-                        message=None, stale=False):
-        """Push new values, or flag the existing ones stale on a failed poll."""
+    def _taskbar_update(self, usage=None, message=None, stale=False):
+        """Push new values, or flag the existing ones stale on a failed poll.
+
+        usage — usage_rows() output. The strip shows the 5h session and the
+        weekly limit (SHARED STRIP CONTRACT) but only those the plan has: an
+        Ultra account has no session limit, so it gets the single weekly row,
+        the same rule the Codex strip follows for server-provided windows."""
         if self.taskbar is None:
             return
-        if session_pct is None or weekly_pct is None:
-            rows = getattr(self, "_taskbar_rows", ())
+        strip = tuple(
+            (short, max(0.0, min(100.0, 100.0 - used)))
+            for key, short in (("session", "5h"), ("weekly", "주간"))
+            for k, _label, used, _reset in (usage or ()) if k == key)
+        if strip:
+            rows = self._taskbar_rows = strip
         else:
-            rows = (("5h", max(0.0, min(100.0, 100.0 - session_pct))),
-                    ("주간", max(0.0, min(100.0, 100.0 - weekly_pct))))
-            self._taskbar_rows = rows
+            rows = getattr(self, "_taskbar_rows", ())
         try:
             self.taskbar.update(rows, message or "불러오는 중", stale)
         except Exception:
@@ -10127,6 +10313,7 @@ if __name__ == "__main__":
         _tb_selftest()
         _visibility_selftest()
         _auth_selftest()
+        _plan_selftest()
         sys.exit(0)
     # Exit silently if another instance already owns the singleton mutex
     # (e.g. the SessionStart hook fired while the widget was already running).
